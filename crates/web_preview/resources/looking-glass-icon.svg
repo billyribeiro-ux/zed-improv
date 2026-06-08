@@ -1,0 +1,44 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Deep indigo / slate badge -->
+    <linearGradient id="badge" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#2B3350"/>
+      <stop offset="1" stop-color="#1B2138"/>
+    </linearGradient>
+    <!-- Cool, clean lens -->
+    <linearGradient id="lens" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F4F7FF"/>
+      <stop offset="1" stop-color="#D4DEF2"/>
+    </linearGradient>
+    <!-- Indigo accent for the metal ring / handle -->
+    <linearGradient id="ring" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6E7BFF"/>
+      <stop offset="1" stop-color="#4A57E0"/>
+    </linearGradient>
+    <filter id="depth" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="20" flood-color="#0A0E1C" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Rounded-square app badge -->
+  <rect x="96" y="96" width="832" height="832" rx="196" fill="url(#badge)"/>
+  <!-- Very subtle top edge light -->
+  <rect x="96" y="96" width="832" height="832" rx="196" fill="none" stroke="#FFFFFF" stroke-opacity="0.06" stroke-width="2"/>
+
+  <!-- Magnifying glass, centered in the badge, slight professional tilt -->
+  <g filter="url(#depth)" transform="rotate(-8 512 512)">
+    <!-- Handle (kept short so it stays within the badge) -->
+    <rect x="690" y="690" width="150" height="68" rx="34" fill="url(#ring)"/>
+
+    <!-- Lens ring centered on the badge (512,512), even weight -->
+    <circle cx="512" cy="512" r="252" fill="url(#ring)"/>
+    <circle cx="512" cy="512" r="206" fill="url(#lens)"/>
+
+    <!-- Crisp code mark </>, centered in the lens -->
+    <g stroke="#2B3350" stroke-width="30" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      <polyline points="446,450 382,512 446,574"/>
+      <polyline points="578,450 642,512 578,574"/>
+      <line x1="540" y1="422" x2="484" y2="602"/>
+    </g>
+  </g>
+</svg>
