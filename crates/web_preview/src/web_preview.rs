@@ -25,8 +25,8 @@ use css_panel::CssPanel;
 use futures::StreamExt as _;
 use gpui::{
     AnyElement, AnyWindowHandle, App, AppContext as _, Bounds, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, MouseButton, MouseDownEvent, ObjectFit, Pixels, Task, WeakEntity,
-    Window, canvas, div, img, prelude::*, px,
+    Focusable, FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Pixels,
+    ScrollWheelEvent, Task, WeakEntity, Window, canvas, div, img, prelude::*, px,
 };
 use language::Point as TextPoint;
 use screencast::DecodedFrame;
@@ -640,34 +640,33 @@ impl WebPreviewView {
     }
 
     /// Forward a left click in the preview image to the page over CDP.
+    /// Map a pane-local mouse position to page CSS coordinates, accounting for the letterboxed image
+    /// rect. Returns `None` if there's no live frame or the point is outside the rendered page.
+    fn page_coords(&self, position: gpui::Point<Pixels>) -> Option<(f32, f32)> {
+        let frame = self.latest_frame.as_ref()?;
+        let pane_bounds = self.image_bounds?;
+        let image_bounds = ObjectFit::Contain.get_bounds(pane_bounds, frame.image.size(0));
+        if !image_bounds.contains(&position) {
+            return None;
+        }
+        screencast::image_to_page_coords(
+            &frame.metadata,
+            f32::from(position.x - image_bounds.origin.x),
+            f32::from(position.y - image_bounds.origin.y),
+            f32::from(image_bounds.size.width),
+            f32::from(image_bounds.size.height),
+        )
+    }
+
     fn forward_click(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         // In pick mode Chrome handles selection via the inspect overlay; don't interfere.
         if self.picking {
             return;
         }
-        let (Some(frame), Some(pane_bounds)) = (&self.latest_frame, self.image_bounds) else {
-            return;
-        };
         let SessionState::Connected(cdp) = &self.state else {
             return;
         };
-
-        // The frame is painted with `ObjectFit::Contain` (letterboxed) inside the pane, so the image
-        // occupies only a sub-rect. Compute that rect the same way `img` does and map the click
-        // against it; clicks in the letterbox margin are outside the page and are ignored.
-        let image_bounds = ObjectFit::Contain.get_bounds(pane_bounds, frame.image.size(0));
-        if !image_bounds.contains(&event.position) {
-            return;
-        }
-        let image_x = f32::from(event.position.x - image_bounds.origin.x);
-        let image_y = f32::from(event.position.y - image_bounds.origin.y);
-        let Some((page_x, page_y)) = screencast::image_to_page_coords(
-            &frame.metadata,
-            image_x,
-            image_y,
-            f32::from(image_bounds.size.width),
-            f32::from(image_bounds.size.height),
-        ) else {
+        let Some((page_x, page_y)) = self.page_coords(event.position) else {
             return;
         };
 
@@ -687,6 +686,68 @@ impl WebPreviewView {
                 .await
                 .log_err();
             }
+        })
+        .detach();
+    }
+
+    /// Forward a scroll wheel event to the page so the user can scroll the preview.
+    fn forward_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        if self.picking {
+            return;
+        }
+        let SessionState::Connected(cdp) = &self.state else {
+            return;
+        };
+        let Some((page_x, page_y)) = self.page_coords(event.position) else {
+            return;
+        };
+        // Convert the scroll delta to pixels. Line-based deltas are scaled to a sensible pixel step.
+        let line_height = 20.0;
+        let delta = event.delta.pixel_delta(px(line_height));
+        let (delta_x, delta_y) = (f32::from(delta.x), f32::from(delta.y));
+        if delta_x == 0.0 && delta_y == 0.0 {
+            return;
+        }
+
+        let cdp = cdp.clone();
+        cx.background_spawn(async move {
+            cdp.send(
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mouseWheel",
+                    "x": page_x,
+                    "y": page_y,
+                    // CDP scrolls the page by the *negative* of the wheel delta direction.
+                    "deltaX": -delta_x,
+                    "deltaY": -delta_y,
+                }),
+            )
+            .await
+            .log_err();
+        })
+        .detach();
+    }
+
+    /// Forward mouse movement so the page gets hover states.
+    fn forward_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.picking {
+            return;
+        }
+        let SessionState::Connected(cdp) = &self.state else {
+            return;
+        };
+        let Some((page_x, page_y)) = self.page_coords(event.position) else {
+            return;
+        };
+
+        let cdp = cdp.clone();
+        cx.background_spawn(async move {
+            cdp.send(
+                "Input.dispatchMouseEvent",
+                json!({ "type": "mouseMoved", "x": page_x, "y": page_y }),
+            )
+            .await
+            .log_err();
         })
         .detach();
     }
@@ -1006,6 +1067,12 @@ impl Render for WebPreviewView {
                             this.forward_click(event, cx);
                         }),
                     )
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                        this.forward_scroll(event, cx);
+                    }))
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                        this.forward_move(event, cx);
+                    }))
                     // In-canvas cue so the user knows pick mode is on (and normal clicks are paused).
                     .when(picking, |this| {
                         this.child(
