@@ -61,6 +61,25 @@ const PRODUCT_NAME: &str = "Looking Glass";
 /// Marker type for deduplicating Looking Glass toasts.
 struct WebPreviewNotice;
 
+/// Classify a session-failure error into a bounded stage label for telemetry. Returns a fixed set
+/// of strings (never raw error text) so the telemetry label cardinality stays bounded.
+fn failure_stage(error: &anyhow::Error) -> &'static str {
+    let text = format!("{error:#}").to_lowercase();
+    if text.contains("dev server") {
+        "dev_server_unreachable"
+    } else if text.contains("chrome") || text.contains("chromium") {
+        "chrome_launch"
+    } else if text.contains("port") || text.contains("debugging") {
+        "debug_port"
+    } else if text.contains("cdp") || text.contains("websocket") {
+        "cdp_connect"
+    } else if text.contains("screencast") {
+        "screencast"
+    } else {
+        "other"
+    }
+}
+
 /// Turn a connection-failure error chain into a single actionable remediation line, so the user
 /// knows *how* to fix it rather than reading a raw anyhow chain.
 fn remediation_for(error: &str) -> String {
@@ -226,6 +245,10 @@ impl WebPreviewView {
                     Ok(cdp) => this.state = SessionState::Connected(cdp),
                     Err(error) => {
                         log::error!("web preview session failed: {error:#}");
+                        telemetry::event!(
+                            "Looking Glass Session Failed",
+                            stage = failure_stage(&error)
+                        );
                         this.state = SessionState::Failed(format!("{error:#}").into());
                     }
                 }
@@ -266,6 +289,7 @@ impl WebPreviewView {
         )
         .await
         .context("waiting for dev server")?;
+        telemetry::event!("Looking Glass Session Stage", stage = "dev_server_ready");
 
         let chrome_path = chrome::locate_chrome(settings.chrome_path.as_deref())?;
         // Unique profile dir + port per session so two panels (or a stale browser) never collide.
@@ -289,10 +313,13 @@ impl WebPreviewView {
         .await
         .context("launching chrome")?;
 
+        telemetry::event!("Looking Glass Session Stage", stage = "chrome_launched");
+
         let ws_url = process.ws_url.clone();
         let cdp = CdpClient::connect(ws_url, cx)
             .await
             .context("connecting CDP")?;
+        telemetry::event!("Looking Glass Session Stage", stage = "cdp_connected");
 
         // Keep the Chrome process alive for the lifetime of the view.
         this.update(cx, |this, _| this._chrome = Some(process)).ok();
@@ -321,6 +348,11 @@ impl WebPreviewView {
             None => source_map::detect_framework(&cdp).await,
         };
         this.update(cx, |this, _| this.framework = framework).ok();
+        telemetry::event!(
+            "Looking Glass Session Stage",
+            stage = "framework_detected",
+            framework = framework.label()
+        );
 
         screencast::start(
             &cdp,
@@ -482,8 +514,20 @@ impl WebPreviewView {
 
     fn handle_resolution(&mut self, resolution: Resolution, cx: &mut Context<Self>) {
         match resolution {
-            Resolution::Source(location) => self.open_source(location, cx),
+            Resolution::Source(location) => {
+                telemetry::event!(
+                    "Looking Glass Pick",
+                    outcome = "source",
+                    framework = self.framework.label()
+                );
+                self.open_source(location, cx)
+            }
             Resolution::SelectorOnly { selector, hint } => {
+                telemetry::event!(
+                    "Looking Glass Pick",
+                    outcome = "selector_only",
+                    framework = self.framework.label()
+                );
                 let message = hint.unwrap_or_else(|| {
                     "No source mapping for this element — its styles are loaded on the right."
                         .to_string()
