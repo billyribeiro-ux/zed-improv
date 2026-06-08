@@ -248,11 +248,21 @@ impl WebPreviewView {
         this: &WeakEntity<Self>,
         cx: &mut gpui::AsyncApp,
     ) -> Result<CdpClient> {
+        // If a dev command is configured and the URL isn't up yet, launch it before waiting.
+        if let Some(command) = settings.dev_command.as_deref() {
+            let reachable = dev_server::is_reachable(&settings.url, http_client.clone()).await;
+            if !reachable {
+                if let Ok(project) = this.read_with(cx, |this, _| this.project.clone()) {
+                    dev_server::spawn_dev_command(command, &project, cx).await;
+                }
+            }
+        }
+
         dev_server::wait_until_ready(
             &settings.url,
             http_client.clone(),
             executor.clone(),
-            Duration::from_secs(30),
+            Duration::from_secs(settings.dev_server_timeout_secs),
         )
         .await
         .context("waiting for dev server")?;
@@ -305,12 +315,20 @@ impl WebPreviewView {
                 .with_context(|| format!("enabling {domain}"))?;
         }
 
-        let framework = source_map::detect_framework(&cdp).await;
+        // Honor an explicit framework override; otherwise auto-detect.
+        let framework = match settings.framework_override {
+            Some(framework) => framework,
+            None => source_map::detect_framework(&cdp).await,
+        };
         this.update(cx, |this, _| this.framework = framework).ok();
 
-        screencast::start(&cdp)
-            .await
-            .context("starting screencast")?;
+        screencast::start(
+            &cdp,
+            settings.screencast_quality,
+            settings.screencast_every_nth_frame,
+        )
+        .await
+        .context("starting screencast")?;
         this.update(cx, |this, cx| {
             this.spawn_event_loops(cdp.clone(), cx);
         })

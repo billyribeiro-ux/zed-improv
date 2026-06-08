@@ -41,13 +41,13 @@ pub struct DecodedFrame {
 
 /// Begin streaming frames. The caller subscribes to `Page.screencastFrame` and feeds each event's
 /// params to [`decode_frame`], then acks via [`ack`].
-pub async fn start(cdp: &CdpClient) -> Result<()> {
+pub async fn start(cdp: &CdpClient, quality: u8, every_nth_frame: u32) -> Result<()> {
     cdp.send(
         "Page.startScreencast",
         json!({
             "format": "jpeg",
-            "quality": 80,
-            "everyNthFrame": 1,
+            "quality": quality,
+            "everyNthFrame": every_nth_frame,
         }),
     )
     .await

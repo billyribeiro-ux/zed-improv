@@ -1,3 +1,4 @@
+use crate::source_map::Framework;
 use settings::{RegisterSetting, Settings};
 
 /// Default dev-server URL when unset. Single source of truth — also referenced in the settings
@@ -9,6 +10,9 @@ pub const DEFAULT_URL: &str = "http://localhost:5173";
 /// override that is used verbatim.
 pub const DEFAULT_REMOTE_DEBUGGING_PORT: u16 = 9222;
 
+/// Default dev-server readiness timeout, in seconds.
+pub const DEFAULT_DEV_SERVER_TIMEOUT_SECS: u64 = 30;
+
 /// Resolved settings for the in-editor web app preview.
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct WebPreviewSettings {
@@ -18,6 +22,25 @@ pub struct WebPreviewSettings {
     pub chrome_path: Option<String>,
     /// Port Chrome exposes its remote debugging endpoint on.
     pub remote_debugging_port: u16,
+    /// Command to launch the dev server if the URL isn't reachable.
+    pub dev_command: Option<String>,
+    /// An explicit framework override, or `None` for auto-detect.
+    pub framework_override: Option<Framework>,
+    /// How long to wait for the dev server to become reachable.
+    pub dev_server_timeout_secs: u64,
+    /// Screencast JPEG quality (1–100).
+    pub screencast_quality: u8,
+    /// Stream only every Nth browser frame.
+    pub screencast_every_nth_frame: u32,
+}
+
+fn parse_framework(value: &str) -> Option<Framework> {
+    match value.trim().to_lowercase().as_str() {
+        "svelte" => Some(Framework::Svelte),
+        "react" => Some(Framework::React),
+        "vue" => Some(Framework::Vue),
+        _ => None, // "auto" or anything unrecognized → auto-detect.
+    }
 }
 
 impl Settings for WebPreviewSettings {
@@ -31,6 +54,21 @@ impl Settings for WebPreviewSettings {
             remote_debugging_port: web_preview
                 .and_then(|settings| settings.remote_debugging_port)
                 .unwrap_or(DEFAULT_REMOTE_DEBUGGING_PORT),
+            dev_command: web_preview.and_then(|settings| settings.dev_command.clone()),
+            framework_override: web_preview
+                .and_then(|settings| settings.framework.as_deref())
+                .and_then(parse_framework),
+            dev_server_timeout_secs: web_preview
+                .and_then(|settings| settings.dev_server_timeout_secs)
+                .unwrap_or(DEFAULT_DEV_SERVER_TIMEOUT_SECS),
+            screencast_quality: web_preview
+                .and_then(|settings| settings.screencast_quality)
+                .unwrap_or(80)
+                .clamp(1, 100) as u8,
+            screencast_every_nth_frame: web_preview
+                .and_then(|settings| settings.screencast_every_nth_frame)
+                .unwrap_or(1)
+                .max(1),
         }
     }
 }

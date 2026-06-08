@@ -15,8 +15,9 @@ entangled with it.
   - `crates/zed/src/main.rs` — `web_preview::init(...)` (1 line)
   - `crates/settings_content/src/settings_content.rs` — one field + one struct
   - `crates/settings/src/vscode_import.rs` — one field (1 line)
-  - `assets/keymaps/default-{macos,linux,windows}.json` — two bindings each
-  - `crates/zed/resources/app-icon-dev.png` + `@2x.png` — our icon (originals: `*.orig`)
+  - `assets/keymaps/default-{macos,linux,windows}.json` — two bindings each (auto-inserted by the script)
+  - `crates/zed/resources/app-icon-dev.png` + `@2x.png` — our icon, auto-swapped by the script
+    (it backs up upstream's to `*.orig` first)
 
 That is the complete footprint. Everything else is stock Zed.
 

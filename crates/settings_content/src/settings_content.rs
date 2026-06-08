@@ -490,10 +490,30 @@ pub struct WebPreviewSettingsContent {
     pub url: Option<String>,
     /// Explicit path to the Chrome/Chromium executable. If unset, common locations are searched.
     pub chrome_path: Option<String>,
-    /// Port Chrome exposes its remote debugging endpoint on.
+    /// Port Chrome exposes its remote debugging endpoint on. The default value means "pick a free
+    /// port automatically"; set a specific port only if you need a fixed one.
     ///
     /// Default: 9222
     pub remote_debugging_port: Option<u16>,
+    /// Command to launch the dev server if the URL isn't already reachable (e.g. "npm run dev").
+    /// Runs in the project root. If unset, you start the dev server yourself.
+    pub dev_command: Option<String>,
+    /// Override framework detection: "svelte", "react", "vue", or "auto".
+    ///
+    /// Default: "auto"
+    pub framework: Option<String>,
+    /// How long to wait (seconds) for the dev server URL to become reachable before failing.
+    ///
+    /// Default: 30
+    pub dev_server_timeout_secs: Option<u64>,
+    /// Screencast JPEG quality, 1–100. Lower trades fidelity for performance.
+    ///
+    /// Default: 80
+    pub screencast_quality: Option<u32>,
+    /// Stream only every Nth browser frame. Higher values reduce CPU/bandwidth at lower smoothness.
+    ///
+    /// Default: 1
+    pub screencast_every_nth_frame: Option<u32>,
 }
 
 #[derive(Clone, Default, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq)]

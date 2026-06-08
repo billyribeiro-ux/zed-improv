@@ -98,10 +98,29 @@ pub struct WebPreviewSettingsContent {
     pub url: Option<String>,
     /// Explicit path to the Chrome/Chromium executable. If unset, common locations are searched.
     pub chrome_path: Option<String>,
-    /// Port Chrome exposes its remote debugging endpoint on.
+    /// Port Chrome exposes its remote debugging endpoint on. The default value means "pick a free
+    /// port automatically"; set a specific port only if you need a fixed one.
     ///
     /// Default: 9222
     pub remote_debugging_port: Option<u16>,
+    /// Command to launch the dev server if the URL isn't already reachable (e.g. "npm run dev").
+    pub dev_command: Option<String>,
+    /// Override framework detection: "svelte", "react", "vue", or "auto".
+    ///
+    /// Default: "auto"
+    pub framework: Option<String>,
+    /// How long to wait (seconds) for the dev server URL to become reachable before failing.
+    ///
+    /// Default: 30
+    pub dev_server_timeout_secs: Option<u64>,
+    /// Screencast JPEG quality, 1–100.
+    ///
+    /// Default: 80
+    pub screencast_quality: Option<u32>,
+    /// Stream only every Nth browser frame.
+    ///
+    /// Default: 1
+    pub screencast_every_nth_frame: Option<u32>,
 }
 RUST
   ok "settings_content: struct"
@@ -118,13 +137,51 @@ add_keymap() {
   local file="$1" open_key="$2" pick_key="$3"
   if ! [[ -f "$file" ]]; then warn "keymap: $file not found"; return; fi
   if grep -qF 'web_preview::OpenWebPreview' "$file"; then skip "keymap: $(basename "$file")"; return; fi
-  warn "keymap: $(basename "$file") needs the Looking Glass bindings added (see patches/keymap-bindings.md)"
-  echo "        open  ($open_key) -> web_preview::OpenWebPreview"
-  echo "        pick  ($pick_key) -> web_preview::ToggleWebPickMode"
+
+  # Insert two context blocks just before the final closing `]` of the top-level array. The default
+  # keymaps are a JSON array of context objects; appending two more is valid regardless of upstream
+  # churn elsewhere in the file. A trailing comma after the new blocks is fine (the loader is lenient
+  # JSONC) and the preceding `}` already has its own comma in these files.
+  local blocks
+  blocks=$(cat <<EOF
+  {
+    "context": "Workspace",
+    "bindings": { "$open_key": "web_preview::OpenWebPreview" }
+  },
+  {
+    "context": "WebPreview",
+    "bindings": { "$pick_key": "web_preview::ToggleWebPickMode" }
+  },
+EOF
+)
+  # Find the last line that is just a closing bracket of the top-level array and insert before it.
+  local last_bracket
+  last_bracket=$(grep -n '^\]' "$file" | tail -1 | cut -d: -f1)
+  if [[ -z "$last_bracket" ]]; then
+    warn "keymap: $(basename "$file") — couldn't find the array close; add bindings manually"
+    return
+  fi
+  { head -n $((last_bracket - 1)) "$file"; printf '%s\n' "$blocks"; tail -n +"$last_bracket" "$file"; } > "$file.tmp" \
+    && mv "$file.tmp" "$file"
+  ok "keymap: $(basename "$file")"
 }
 add_keymap assets/keymaps/default-macos.json   "cmd-k cmd-shift-v"  "cmd-shift-i"
 add_keymap assets/keymaps/default-linux.json   "ctrl-k ctrl-shift-v" "ctrl-shift-i"
 add_keymap assets/keymaps/default-windows.json "ctrl-k ctrl-shift-v" "ctrl-shift-i"
+
+# ---------------------------------------------------------------------------
+# 6. Dev-channel app icon — swap in the Looking Glass icon so a bundled app uses it.
+# ---------------------------------------------------------------------------
+swap_icon() {
+  local src="$1" dst="$2"
+  if [[ ! -f "$src" ]]; then warn "icon: source $src missing in the crate"; return; fi
+  if [[ -f "$dst.orig" ]]; then skip "icon: $(basename "$dst")"; return; fi
+  if [[ -f "$dst" ]]; then cp "$dst" "$dst.orig"; fi
+  cp "$src" "$dst"
+  ok "icon: $(basename "$dst")"
+}
+swap_icon crates/web_preview/resources/app-icon.png     crates/zed/resources/app-icon-dev.png
+swap_icon crates/web_preview/resources/app-icon@2x.png  crates/zed/resources/app-icon-dev@2x.png
 
 echo
 if [[ "$NEEDS_MANUAL" -eq 1 ]]; then
