@@ -106,8 +106,14 @@ pub async fn launch(
     let child = smol::process::Command::new(&chrome_path)
         .arg(format!("--remote-debugging-port={port}"))
         .arg(format!("--user-data-dir={}", user_data_dir.display()))
+        // Headless so there is no separate Chrome window for the user to accidentally close (which
+        // would kill the preview). The page renders entirely inside Zed via the CDP screencast.
+        // `--headless=new` keeps full rendering + screencast + CSS/Overlay support.
+        .arg("--headless=new")
+        .arg("--hide-scrollbars")
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
+        .arg("--disable-gpu")
         .arg(url)
         .spawn()
         .with_context(|| format!("spawning chrome at {}", chrome_path.display()))?;

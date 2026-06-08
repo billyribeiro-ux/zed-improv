@@ -960,9 +960,16 @@ impl Render for WebPreviewView {
         // Clone so the borrow of `cx` is released before the `&mut cx` uses below.
         let colors = cx.theme().colors().clone();
 
-        let preview = if let Some(image) =
+        // Only show the live frame while actually connected. On Disconnected/Failed, fall through to
+        // the onboarding view (which carries the Retry button) instead of leaving a frozen, dead
+        // last frame on screen with no way to recover.
+        let connected = matches!(self.state, SessionState::Connected(_));
+        let live_image = if connected {
             self.latest_frame.as_ref().map(|frame| frame.image.clone())
-        {
+        } else {
+            None
+        };
+        let preview = if let Some(image) = live_image {
             // Rotate retained frames and release the GPU texture of the one two frames back, so the
             // screencast doesn't leak a sprite-atlas tile per frame (livekit pattern).
             if let Some(current) = self.current_rendered_frame.take() {
