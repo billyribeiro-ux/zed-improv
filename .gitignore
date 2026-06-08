@@ -41,3 +41,6 @@ xcuserdata/
 
 # `nix build` output
 /result
+
+# Local backups of original Zed icons (replaced by Looking Glass)
+*.orig
