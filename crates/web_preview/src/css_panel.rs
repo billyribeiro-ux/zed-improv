@@ -20,7 +20,6 @@ use crate::cdp::CdpClient;
 use anyhow::{Context as _, Result};
 use collections::HashMap;
 use editor::{Editor, EditorEvent};
-use futures::FutureExt as _;
 use gpui::{ClipboardItem, Entity, FocusHandle, Focusable, Task, WeakEntity, prelude::*};
 use language::{Bias, Buffer, PointUtf16, Unclipped};
 use parking_lot::Mutex;
@@ -32,6 +31,10 @@ use ui::{Label, Tooltip, prelude::*};
 use workspace::Toast;
 use workspace::Workspace;
 use workspace::notifications::NotificationId;
+
+/// How long to wait for typing to settle before applying a live CSS edit. Coalesces a burst of
+/// keystrokes into a single `CSS.setStyleTexts` + re-fetch.
+const APPLY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Shared map of `styleSheetId` → metadata, populated from `CSS.styleSheetAdded` events by the
 /// session. Lets the panel decide whether an edited rule can be written back to a source file.
@@ -162,8 +165,9 @@ pub struct CssPanel {
     node_id: Option<i64>,
     rules: Vec<RuleEntry>,
     status: Status,
-    /// Guards against re-applying while we programmatically reset a buffer's text.
-    suppress_apply: bool,
+    /// A transient message shown when a *settled* live edit fails to apply (read-only sheet,
+    /// detached node) — distinct from the expected mid-token parse failures, which are not surfaced.
+    apply_error: Option<SharedString>,
     _load_task: Option<Task<()>>,
     _apply_task: Option<Task<()>>,
     _write_task: Option<Task<()>>,
@@ -193,7 +197,7 @@ impl CssPanel {
             node_id: None,
             rules: Vec::new(),
             status: Status::Empty,
-            suppress_apply: false,
+            apply_error: None,
             _load_task: None,
             _apply_task: None,
             _write_task: None,
@@ -212,12 +216,17 @@ impl CssPanel {
         self.node_id = Some(node_id);
         self.status = Status::Loading;
         self.rules.clear();
+        self.apply_error = None;
         cx.notify();
 
+        let languages = self.project.read(cx).languages().clone();
         let task = cx.spawn_in(window, async move |this, cx| {
+            // Await the CSS language so the first pick gets syntax highlighting / LSP, rather than
+            // intermittently falling back to plain text on a cold registry (`now_or_never`).
+            let css_language = languages.language_for_name("CSS").await.ok();
             let result = Self::fetch_matched_rules(&cdp, node_id).await;
             this.update_in(cx, |this, window, cx| match result {
-                Ok(loaded) => this.build_rule_editors(loaded, window, cx),
+                Ok(loaded) => this.build_rule_editors(loaded, css_language, window, cx),
                 Err(error) => {
                     this.status = Status::Error(format!("{error:#}").into());
                     cx.notify();
@@ -232,17 +241,10 @@ impl CssPanel {
     fn build_rule_editors(
         &mut self,
         loaded: Vec<LoadedRule>,
+        css_language: Option<Arc<language::Language>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let css_language = self
-            .project
-            .read(cx)
-            .languages()
-            .language_for_name("CSS")
-            .now_or_never()
-            .and_then(Result::ok);
-
         let mut rules = Vec::with_capacity(loaded.len());
         for (index, rule) in loaded.into_iter().enumerate() {
             let buffer = cx.new(|cx| {
@@ -257,7 +259,7 @@ impl CssPanel {
 
             let subscription =
                 cx.subscribe(&editor, move |this, editor, event: &EditorEvent, cx| {
-                    if matches!(event, EditorEvent::BufferEdited) && !this.suppress_apply {
+                    if matches!(event, EditorEvent::BufferEdited) {
                         let text = editor.read(cx).text(cx);
                         this.apply_live(index, text, cx);
                     }
@@ -352,38 +354,75 @@ impl CssPanel {
         Ok(rules)
     }
 
-    /// Push rule `index`'s current declaration text to the page live via CDP.
+    /// Debounced live-apply of rule `index`. Each keystroke resets a short timer; only after the
+    /// text settles do we send one `CSS.setStyleTexts` and re-fetch — instead of two websocket
+    /// round-trips (and a guaranteed mid-token parse failure) on every keystroke.
     fn apply_live(&mut self, index: usize, css_text: String, cx: &mut Context<Self>) {
-        let (Some(cdp), Some(rule)) = (self.cdp.clone(), self.rules.get(index)) else {
+        let Some(cdp) = self.cdp.clone() else {
+            return;
+        };
+        let Some(rule) = self.rules.get(index) else {
             return;
         };
         let target = rule.target.clone();
         let node_id = self.node_id;
+        let executor = cx.background_executor().clone();
 
         let task = cx.spawn(async move |this, cx| {
+            // Debounce: wait for typing to settle. A newer keystroke replaces this task (dropping it
+            // here, cancelling the wait) before this fires.
+            executor.timer(APPLY_DEBOUNCE).await;
+
             match cdp
                 .send("CSS.setStyleTexts", set_style_edit(&target, &css_text))
                 .await
             {
                 Ok(_) => {
-                    // Re-fetch to keep this rule's edit range valid after the stylesheet changed.
+                    // Re-fetch and refresh the ranges of *every* rule: editing one rule shifts the
+                    // offsets of later rules in the same stylesheet, so only updating `index` would
+                    // leave siblings stale. Match by stable identity, not position.
                     if let Some(node_id) = node_id {
                         if let Ok(loaded) = Self::fetch_matched_rules(&cdp, node_id).await {
-                            this.update(cx, |this, _| {
-                                if let Some(fresh) = loaded.get(index) {
-                                    if let Some(entry) = this.rules.get_mut(index) {
-                                        entry.target = fresh.target.clone();
-                                    }
-                                }
+                            this.update(cx, |this, cx| {
+                                this.refresh_targets(&loaded);
+                                this.clear_apply_error(cx);
                             })
                             .ok();
                         }
                     }
                 }
-                Err(error) => log::warn!("CSS.setStyleTexts failed: {error:#}"),
+                Err(error) => {
+                    // Settled text that still fails is a real problem (read-only sheet, detached
+                    // node), not a mid-token typo — surface it.
+                    log::warn!("CSS.setStyleTexts failed: {error:#}");
+                    this.update(cx, |this, cx| {
+                        this.apply_error = Some("Couldn't apply this change to the page.".into());
+                        cx.notify();
+                    })
+                    .ok();
+                }
             }
         });
         self._apply_task = Some(task);
+    }
+
+    /// Refresh every rule entry's `target` from a fresh fetch, matched by stable identity
+    /// (`styleSheetId` + selector) so positional drift can't mis-assign ranges.
+    fn refresh_targets(&mut self, loaded: &[LoadedRule]) {
+        for entry in &mut self.rules {
+            if let Some(fresh) = loaded.iter().find(|candidate| {
+                candidate.target.style_sheet_id == entry.target.style_sheet_id
+                    && candidate.target.selector == entry.target.selector
+            }) {
+                entry.target = fresh.target.clone();
+            }
+        }
+    }
+
+    fn clear_apply_error(&mut self, cx: &mut Context<Self>) {
+        if self.apply_error.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// Persist rule `index` to source: deterministically when its route is a file, else via agent.
@@ -716,16 +755,25 @@ impl Render for CssPanel {
             }
         };
 
+        let apply_error = self.apply_error.clone();
         v_flex()
             .size_full()
             .bg(colors.panel_background)
             .child(
-                div()
+                h_flex()
+                    .justify_between()
                     .px_2()
                     .py_1()
                     .border_b_1()
                     .border_color(colors.border)
-                    .child(Label::new("Styles")),
+                    .child(Label::new("Styles"))
+                    .when_some(apply_error, |this, message| {
+                        this.child(
+                            Label::new(message)
+                                .size(LabelSize::Small)
+                                .color(Color::Error),
+                        )
+                    }),
             )
             .child(div().flex_1().child(body))
     }
