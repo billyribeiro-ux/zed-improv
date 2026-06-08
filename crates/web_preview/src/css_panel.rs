@@ -22,7 +22,7 @@ use collections::HashMap;
 use editor::{Editor, EditorEvent};
 use futures::FutureExt as _;
 use gpui::{ClipboardItem, Entity, FocusHandle, Focusable, Task, WeakEntity, prelude::*};
-use language::{Buffer, Point};
+use language::{Bias, Buffer, PointUtf16, Unclipped};
 use parking_lot::Mutex;
 use project::Project;
 use serde_json::{Value, json};
@@ -82,6 +82,9 @@ pub fn record_style_sheet(registry: &StyleSheetRegistry, params: &Value) {
 }
 
 /// The CDP `SourceRange` for a declaration block, plus its owning stylesheet and matched selector.
+///
+/// Note: CDP `SourceRange` columns are **UTF-16 code-unit** offsets, not byte offsets. They are
+/// converted to byte offsets via `PointUtf16` before any `Buffer::edit` (see `write_deterministic`).
 #[derive(Clone, Debug)]
 struct EditTarget {
     style_sheet_id: String,
@@ -91,6 +94,26 @@ struct EditTarget {
     end_column: u32,
     /// The selector this rule matched (for the label and the agent prompt). `None` for inline.
     selector: Option<String>,
+    /// The declaration text CDP reported for this range at load. Used to verify the on-disk span
+    /// still matches before a deterministic write, so we never clobber drifted source.
+    original_css: String,
+}
+
+/// Outcome of a deterministic write attempt.
+enum WriteOutcome {
+    /// The edit was applied (caller saves the buffer).
+    Written,
+    /// The on-disk text diverged from what CDP reported — not written, to avoid corruption.
+    Drifted,
+    /// The reported range didn't resolve to a valid span in the file.
+    RangeInvalid,
+}
+
+/// Normalize CSS declaration text for the drift comparison: collapse all runs of ASCII whitespace
+/// to a single space and trim. Tolerates trivial formatting differences (indentation, trailing
+/// semicolons spacing) between CDP's report and on-disk text without tolerating real content changes.
+fn normalize_css(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// A loaded, raw matched rule (before editors are built).
@@ -380,6 +403,14 @@ impl CssPanel {
     }
 
     /// Deterministic write-back: open the source file and replace the rule's declaration range.
+    ///
+    /// Two safety properties protect the user's source from silent corruption:
+    /// 1. **Encoding:** CDP `SourceRange` columns are UTF-16 code units; they are converted to byte
+    ///    offsets via `PointUtf16` before editing, so lines with non-ASCII content edit correctly.
+    /// 2. **Drift guard:** the on-disk text at the reported range is compared against the declaration
+    ///    CDP originally reported (`target.original_css`). On mismatch — the browser's loaded CSS has
+    ///    diverged from disk (HMR-stale, transformed output, or the user edited it in Zed) — we do
+    ///    NOT edit; we surface an error and leave the file untouched.
     fn write_deterministic(
         &mut self,
         abs_path: PathBuf,
@@ -395,35 +426,70 @@ impl CssPanel {
         }
         let project = self.project.clone();
         let css_text = css_text.to_string();
-        let range_start = Point::new(target.start_line, target.start_column);
-        let range_end = Point::new(target.end_line, target.end_column);
+        let original_css = target.original_css.clone();
+        // CDP columns are UTF-16 code units.
+        let range_start = PointUtf16::new(target.start_line, target.start_column);
+        let range_end = PointUtf16::new(target.end_line, target.end_column);
 
         let task = cx.spawn(async move |this, cx| {
-            let result: Result<()> = async {
+            let outcome: Result<WriteOutcome> = async {
                 let buffer = project
                     .update(cx, |project, cx| project.open_local_buffer(&abs_path, cx))
                     .await?;
-                buffer.update(cx, |buffer, cx| {
-                    let start = buffer.clip_point(range_start, language::Bias::Left);
-                    let end = buffer.clip_point(range_end, language::Bias::Right);
+                let outcome = buffer.update(cx, |buffer, cx| {
+                    let snapshot = buffer.snapshot();
+                    // UTF-16 (line, col) -> clamped PointUtf16 -> byte offset.
+                    let start = snapshot.point_utf16_to_offset(
+                        snapshot.clip_point_utf16(Unclipped(range_start), Bias::Left),
+                    );
+                    let end = snapshot.point_utf16_to_offset(
+                        snapshot.clip_point_utf16(Unclipped(range_end), Bias::Right),
+                    );
+                    if start > end || end > buffer.len() {
+                        return WriteOutcome::RangeInvalid;
+                    }
+                    // Drift guard: the on-disk span must still match what CDP reported.
+                    let on_disk: String = snapshot.text_for_range(start..end).collect();
+                    if normalize_css(&on_disk) != normalize_css(&original_css) {
+                        return WriteOutcome::Drifted;
+                    }
                     buffer.edit([(start..end, css_text.clone())], None, cx);
+                    WriteOutcome::Written
                 });
-                project
-                    .update(cx, |project, cx| project.save_buffer(buffer, cx))
-                    .await?;
-                Ok(())
+                if matches!(outcome, WriteOutcome::Written) {
+                    project
+                        .update(cx, |project, cx| project.save_buffer(buffer, cx))
+                        .await?;
+                }
+                Ok(outcome)
             }
             .await;
 
-            if let Err(error) = result {
-                log::error!("web preview CSS write-back failed: {error:#}");
-                this.update(cx, |this, cx| {
+            this.update(cx, |this, cx| match outcome {
+                Ok(WriteOutcome::Written) => {}
+                Ok(WriteOutcome::Drifted) => {
+                    this.status = Status::Error(
+                        "Source has changed since this rule was loaded — not written, to avoid \
+                             overwriting unrelated code. Re-pick the element and try again, or use \
+                             the agent."
+                            .into(),
+                    );
+                    cx.notify();
+                }
+                Ok(WriteOutcome::RangeInvalid) => {
+                    this.status = Status::Error(
+                        "Couldn't locate this rule's range in the source file.".into(),
+                    );
+                    cx.notify();
+                }
+                Err(error) => {
+                    log::error!("web preview CSS write-back failed: {error:#}");
                     this.status =
                         Status::Error(format!("Write to source failed: {error:#}").into());
                     cx.notify();
-                })
-                .ok();
-            }
+                }
+            })
+            .ok();
         });
         self._write_task = Some(task);
     }
@@ -504,6 +570,7 @@ fn parse_edit_target(style: &Value) -> Option<EditTarget> {
         end_line: range.get("endLine")?.as_u64()? as u32,
         end_column: range.get("endColumn")?.as_u64()? as u32,
         selector: None,
+        original_css: declaration_text(style),
     })
 }
 

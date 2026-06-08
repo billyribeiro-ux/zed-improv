@@ -193,6 +193,11 @@ const VUE_RESOLVER: &str = r#"
 fn parse_location(value: &Value) -> Option<SourceLocation> {
     let file = value.get("file")?.as_str()?.to_string();
     let line = value.get("line")?.as_u64()? as u32;
+    // Framework line numbers are 1-based. A line of 0 violates that invariant (e.g. an unguarded
+    // `parseInt` returning 0); reject it so we degrade to selector-only rather than opening row 0.
+    if line == 0 {
+        return None;
+    }
     // Column is optional; default to 0 when absent rather than failing the whole parse.
     let column = value.get("column").and_then(Value::as_u64).unwrap_or(0) as u32;
     Some(SourceLocation { file, line, column })
@@ -287,5 +292,12 @@ mod tests {
     #[test]
     fn null_result_yields_none() {
         assert!(parse_location(&Value::Null).is_none());
+    }
+
+    #[test]
+    fn line_zero_is_rejected() {
+        // A 0 line violates the 1-based invariant and must degrade to selector-only, not open row 0.
+        let value = json!({ "file": "src/App.svelte", "line": 0, "column": 4 });
+        assert!(parse_location(&value).is_none());
     }
 }
