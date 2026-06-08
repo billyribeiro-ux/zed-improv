@@ -425,6 +425,18 @@ impl CssPanel {
         }
     }
 
+    /// Show a short transient toast (e.g. confirming a successful write to source).
+    fn notify(&self, message: String, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(NotificationId::unique::<CssWriteBackNotice>(), message),
+                    cx,
+                );
+            })
+            .ok();
+    }
+
     /// Persist rule `index` to source: deterministically when its route is a file, else via agent.
     fn write_rule_to_source(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(rule) = self.rules.get(index) else {
@@ -505,7 +517,10 @@ impl CssPanel {
             .await;
 
             this.update(cx, |this, cx| match outcome {
-                Ok(WriteOutcome::Written) => {}
+                Ok(WriteOutcome::Written) => {
+                    this.notify("Saved to source".to_string(), cx);
+                    this.clear_apply_error(cx);
+                }
                 Ok(WriteOutcome::Drifted) => {
                     this.status = Status::Error(
                         "Source has changed since this rule was loaded — not written, to avoid \

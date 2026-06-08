@@ -35,7 +35,7 @@ use settings::Settings as _;
 use source_map::{Framework, Resolution, SourceLocation};
 use std::sync::Arc;
 use std::time::Duration;
-use ui::{Icon, IconButton, IconName, IconSize, Label, Tooltip, prelude::*};
+use ui::{CommonAnimationExt, Icon, IconButton, IconName, IconSize, Label, Tooltip, prelude::*};
 use util::ResultExt as _;
 use web_preview_settings::{DEFAULT_REMOTE_DEBUGGING_PORT, WebPreviewSettings};
 use workspace::item::{Item, ItemEvent};
@@ -50,6 +50,8 @@ gpui::actions!(
         OpenWebPreview,
         /// Toggle element pick mode in the web preview (click an element to open its source).
         ToggleWebPickMode,
+        /// Reload the previewed page.
+        ReloadWebPreview,
     ]
 );
 
@@ -526,12 +528,22 @@ impl WebPreviewView {
     }
 
     fn toggle_pick_mode(&mut self, cx: &mut Context<Self>) {
+        self.set_pick_mode(!self.picking, cx);
+    }
+
+    /// Cancel pick mode if active (bound to Esc).
+    fn cancel_pick_mode(&mut self, cx: &mut Context<Self>) {
+        if self.picking {
+            self.set_pick_mode(false, cx);
+        }
+    }
+
+    fn set_pick_mode(&mut self, picking: bool, cx: &mut Context<Self>) {
         let SessionState::Connected(cdp) = &self.state else {
             return;
         };
         let cdp = cdp.clone();
-        self.picking = !self.picking;
-        let picking = self.picking;
+        self.picking = picking;
         cx.background_spawn(async move {
             let mode = if picking { "searchForNode" } else { "none" };
             cdp.send(
@@ -549,6 +561,20 @@ impl WebPreviewView {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Reload the previewed page over CDP.
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        let SessionState::Connected(cdp) = &self.state else {
+            return;
+        };
+        let cdp = cdp.clone();
+        cx.background_spawn(async move {
+            cdp.send("Page.reload", json!({ "ignoreCache": false }))
+                .await
+                .log_err();
+        })
+        .detach();
     }
 
     /// Forward a left click in the preview image to the page over CDP.
@@ -637,6 +663,7 @@ impl WebPreviewView {
     fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
 
+        let connected = matches!(self.state, SessionState::Connected(_));
         let (status_text, status_color) = match &self.state {
             SessionState::Connecting => ("Connecting…".to_string(), Color::Muted),
             SessionState::Connected(_) => {
@@ -680,6 +707,13 @@ impl WebPreviewView {
             .child(
                 h_flex()
                     .gap_0p5()
+                    .when(connected, |this| {
+                        this.child(
+                            IconButton::new("looking-glass-reload", IconName::RotateCw)
+                                .tooltip(Tooltip::text("Reload the page"))
+                                .on_click(cx.listener(|this, _, _window, cx| this.reload(cx))),
+                        )
+                    })
                     .child(
                         IconButton::new("looking-glass-pick", IconName::MagnifyingGlass)
                             .tooltip(Tooltip::text("Pick an element to open its source (⌘⇧I)"))
@@ -745,17 +779,31 @@ impl WebPreviewView {
                 .child(Label::new(text.to_string()).color(Color::Muted))
         };
 
+        // While actively working toward a first frame, show an animated spinner; on a
+        // failed/disconnected state show the static product mark.
+        let loading = matches!(
+            self.state,
+            SessionState::Connecting | SessionState::Connected(_)
+        );
+
         v_flex()
             .size_full()
             .items_center()
             .justify_center()
             .gap_4()
             .p_8()
-            .child(
+            .child(if loading {
+                Icon::new(IconName::LoadCircle)
+                    .size(IconSize::XLarge)
+                    .color(Color::Accent)
+                    .with_rotate_animation(3)
+                    .into_any_element()
+            } else {
                 Icon::new(IconName::Screen)
                     .size(IconSize::XLarge)
-                    .color(Color::Muted),
-            )
+                    .color(Color::Muted)
+                    .into_any_element()
+            })
             .child(
                 v_flex()
                     .items_center()
@@ -850,22 +898,24 @@ impl Render for WebPreviewView {
         // Clone so the borrow of `cx` is released before the `&mut cx` uses below.
         let colors = cx.theme().colors().clone();
 
-        let preview =
-            if let Some(image) = self.latest_frame.as_ref().map(|frame| frame.image.clone()) {
-                // Rotate retained frames and release the GPU texture of the one two frames back, so the
-                // screencast doesn't leak a sprite-atlas tile per frame (livekit pattern).
-                if let Some(current) = self.current_rendered_frame.take() {
-                    if let Some(previous) = self.previous_rendered_frame.take() {
-                        if previous.id != current.id {
-                            window.drop_image(previous).log_err();
-                        }
+        let preview = if let Some(image) =
+            self.latest_frame.as_ref().map(|frame| frame.image.clone())
+        {
+            // Rotate retained frames and release the GPU texture of the one two frames back, so the
+            // screencast doesn't leak a sprite-atlas tile per frame (livekit pattern).
+            if let Some(current) = self.current_rendered_frame.take() {
+                if let Some(previous) = self.previous_rendered_frame.take() {
+                    if previous.id != current.id {
+                        window.drop_image(previous).log_err();
                     }
-                    self.previous_rendered_frame = Some(current);
                 }
-                self.current_rendered_frame = Some(image.clone());
+                self.previous_rendered_frame = Some(current);
+            }
+            self.current_rendered_frame = Some(image.clone());
 
-                let view = cx.entity().downgrade();
-                div()
+            let view = cx.entity().downgrade();
+            let picking = self.picking;
+            div()
                     .relative()
                     .size_full()
                     .child(img(image).size_full())
@@ -887,10 +937,37 @@ impl Render for WebPreviewView {
                             this.forward_click(event, cx);
                         }),
                     )
+                    // In-canvas cue so the user knows pick mode is on (and normal clicks are paused).
+                    .when(picking, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .top_2()
+                                .left_0()
+                                .right_0()
+                                .flex()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(colors.elevated_surface_background)
+                                        .border_1()
+                                        .border_color(colors.border)
+                                        .child(
+                                            Label::new(
+                                                "Pick mode — click an element to open its source · Esc to cancel",
+                                            )
+                                            .size(LabelSize::Small),
+                                        ),
+                                ),
+                        )
+                    })
                     .into_any_element()
-            } else {
-                self.render_onboarding(cx)
-            };
+        } else {
+            self.render_onboarding(cx)
+        };
 
         // Build sub-elements that borrow `cx` up front, so the builder chain below doesn't
         // re-borrow `cx` while it already holds a listener closure.
@@ -908,6 +985,8 @@ impl Render for WebPreviewView {
             .on_action(
                 cx.listener(|this, _: &ToggleWebPickMode, _window, cx| this.toggle_pick_mode(cx)),
             )
+            .on_action(cx.listener(|this, _: &ReloadWebPreview, _window, cx| this.reload(cx)))
+            .on_action(cx.listener(|this, _: &menu::Cancel, _window, cx| this.cancel_pick_mode(cx)))
             .child(header)
             .child(
                 h_flex()

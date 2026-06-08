@@ -25,6 +25,7 @@ http_client.workspace = true
 image.workspace = true
 language.workspace = true
 log.workspace = true
+menu.workspace = true
 parking_lot.workspace = true
 project.workspace = true
 serde.workspace = true
