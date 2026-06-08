@@ -24,8 +24,8 @@ use css_panel::CssPanel;
 use futures::StreamExt as _;
 use gpui::{
     AnyElement, AnyWindowHandle, App, AppContext as _, Bounds, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, MouseButton, MouseDownEvent, Pixels, Task, WeakEntity, Window, canvas,
-    div, img, prelude::*, px,
+    Focusable, FontWeight, MouseButton, MouseDownEvent, ObjectFit, Pixels, Task, WeakEntity,
+    Window, canvas, div, img, prelude::*, px,
 };
 use language::Point as TextPoint;
 use screencast::DecodedFrame;
@@ -99,6 +99,12 @@ pub struct WebPreviewView {
     /// Whether the in-panel shortcuts/help overlay is showing.
     show_help: bool,
     latest_frame: Option<DecodedFrame>,
+    /// The frame currently being painted, and the one before it. Each decoded frame is a fresh
+    /// `RenderImage` that inserts a GPU sprite-atlas tile keyed by its id, so old frames must be
+    /// explicitly released with `window.drop_image` or they leak GPU memory for the whole session
+    /// (mirrors `livekit_client::RemoteVideoTrackView`).
+    current_rendered_frame: Option<Arc<gpui::RenderImage>>,
+    previous_rendered_frame: Option<Arc<gpui::RenderImage>>,
     /// Bounds of the rendered preview image, captured each frame for click→page coordinate mapping.
     image_bounds: Option<Bounds<Pixels>>,
     css_panel: Entity<CssPanel>,
@@ -128,6 +134,22 @@ impl WebPreviewView {
                 cx,
             )
         });
+        // Release any GPU frame textures still retained when the view is dropped.
+        cx.on_release(|this, cx| {
+            for frame in [
+                this.previous_rendered_frame.take(),
+                this.current_rendered_frame.take(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                this.window_handle
+                    .update(cx, |_, window, _| window.drop_image(frame).log_err())
+                    .ok();
+            }
+        })
+        .detach();
+
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             window_handle: window.window_handle(),
@@ -139,6 +161,8 @@ impl WebPreviewView {
             picking: false,
             show_help: false,
             latest_frame: None,
+            current_rendered_frame: None,
+            previous_rendered_frame: None,
             image_bounds: None,
             css_panel,
             style_sheets,
@@ -453,22 +477,31 @@ impl WebPreviewView {
         if self.picking {
             return;
         }
-        let (Some(frame), Some(bounds)) = (&self.latest_frame, self.image_bounds) else {
+        let (Some(frame), Some(pane_bounds)) = (&self.latest_frame, self.image_bounds) else {
             return;
         };
         let SessionState::Connected(cdp) = &self.state else {
             return;
         };
 
-        let image_x = f32::from(event.position.x - bounds.origin.x);
-        let image_y = f32::from(event.position.y - bounds.origin.y);
-        let (page_x, page_y) = screencast::image_to_page_coords(
+        // The frame is painted with `ObjectFit::Contain` (letterboxed) inside the pane, so the image
+        // occupies only a sub-rect. Compute that rect the same way `img` does and map the click
+        // against it; clicks in the letterbox margin are outside the page and are ignored.
+        let image_bounds = ObjectFit::Contain.get_bounds(pane_bounds, frame.image.size(0));
+        if !image_bounds.contains(&event.position) {
+            return;
+        }
+        let image_x = f32::from(event.position.x - image_bounds.origin.x);
+        let image_y = f32::from(event.position.y - image_bounds.origin.y);
+        let Some((page_x, page_y)) = screencast::image_to_page_coords(
             &frame.metadata,
             image_x,
             image_y,
-            f32::from(bounds.size.width),
-            f32::from(bounds.size.height),
-        );
+            f32::from(image_bounds.size.width),
+            f32::from(image_bounds.size.height),
+        ) else {
+            return;
+        };
 
         let cdp = cdp.clone();
         cx.background_spawn(async move {
@@ -712,39 +745,51 @@ impl WebPreviewView {
 }
 
 impl Render for WebPreviewView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Clone so the borrow of `cx` is released before the `&mut cx` uses below.
         let colors = cx.theme().colors().clone();
 
-        let preview = if self.latest_frame.is_some() {
-            let image = self.latest_frame.as_ref().map(|frame| frame.image.clone());
-            let view = cx.entity().downgrade();
-            div()
-                .relative()
-                .size_full()
-                .when_some(image, |this, image| this.child(img(image).size_full()))
-                .child(
-                    // Capture the rendered image's bounds each layout for click→page mapping.
-                    canvas(
-                        move |bounds, _window, cx| {
-                            view.update(cx, |this, _| this.image_bounds = Some(bounds))
-                                .ok();
-                        },
-                        |_bounds, _, _window, _cx| {},
+        let preview =
+            if let Some(image) = self.latest_frame.as_ref().map(|frame| frame.image.clone()) {
+                // Rotate retained frames and release the GPU texture of the one two frames back, so the
+                // screencast doesn't leak a sprite-atlas tile per frame (livekit pattern).
+                if let Some(current) = self.current_rendered_frame.take() {
+                    if let Some(previous) = self.previous_rendered_frame.take() {
+                        if previous.id != current.id {
+                            window.drop_image(previous).log_err();
+                        }
+                    }
+                    self.previous_rendered_frame = Some(current);
+                }
+                self.current_rendered_frame = Some(image.clone());
+
+                let view = cx.entity().downgrade();
+                div()
+                    .relative()
+                    .size_full()
+                    .child(img(image).size_full())
+                    .child(
+                        // Capture the rendered image's bounds each layout for click→page mapping.
+                        canvas(
+                            move |bounds, _window, cx| {
+                                view.update(cx, |this, _| this.image_bounds = Some(bounds))
+                                    .ok();
+                            },
+                            |_bounds, _, _window, _cx| {},
+                        )
+                        .absolute()
+                        .size_full(),
                     )
-                    .absolute()
-                    .size_full(),
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, event: &MouseDownEvent, _window, cx| {
-                        this.forward_click(event, cx);
-                    }),
-                )
-                .into_any_element()
-        } else {
-            self.render_onboarding(cx)
-        };
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                            this.forward_click(event, cx);
+                        }),
+                    )
+                    .into_any_element()
+            } else {
+                self.render_onboarding(cx)
+            };
 
         // Build sub-elements that borrow `cx` up front, so the builder chain below doesn't
         // re-borrow `cx` while it already holds a listener closure.

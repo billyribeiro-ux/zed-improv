@@ -105,29 +105,33 @@ pub fn decode_frame(params: &Value) -> Result<DecodedFrame> {
     })
 }
 
-/// Translate a point in the rendered image (in image pixels, top-left origin) to page CSS
-/// coordinates, for `Input.dispatchMouseEvent`. `image_size` is the decoded frame's pixel size as
-/// it is laid out in the panel.
+/// Translate a point within the rendered image (image pixels, top-left origin) to page CSS
+/// coordinates for `Input.dispatchMouseEvent`. `image_width`/`image_height` are the dimensions of
+/// the *contained* (letterboxed) image rect, not the whole pane.
+///
+/// Returns `None` when the frame can't be mapped meaningfully (image or device dimensions are zero,
+/// e.g. a transient post-navigation frame), so the caller skips dispatch rather than sending a
+/// click to the page origin.
 pub fn image_to_page_coords(
     metadata: &FrameMetadata,
     image_x: f32,
     image_y: f32,
     image_width: f32,
     image_height: f32,
-) -> (f32, f32) {
+) -> Option<(f32, f32)> {
+    if image_width <= 0.0
+        || image_height <= 0.0
+        || metadata.device_width <= 0.0
+        || metadata.device_height <= 0.0
+    {
+        return None;
+    }
+
     // The captured bitmap covers the device viewport (device_width x device_height) scaled to fit
-    // the panel. Map the click into device space, then divide out the page scale factor and add the
-    // scroll offset to land on the page's CSS-pixel coordinate.
-    let device_x = if image_width > 0.0 {
-        image_x / image_width * metadata.device_width
-    } else {
-        0.0
-    };
-    let device_y = if image_height > 0.0 {
-        image_y / image_height * metadata.device_height
-    } else {
-        0.0
-    };
+    // the image rect. Map the click into device space, then divide out the page scale factor and add
+    // the scroll offset to land on the page's CSS-pixel coordinate.
+    let device_x = image_x / image_width * metadata.device_width;
+    let device_y = image_y / image_height * metadata.device_height;
 
     let scale = if metadata.page_scale_factor != 0.0 {
         metadata.page_scale_factor
@@ -136,10 +140,11 @@ pub fn image_to_page_coords(
     };
 
     // `offset_top` is the captured region's top inset within the device viewport; subtract it before
-    // dividing out the scale so clicks land correctly when the page is scrolled.
-    let page_x = device_x / scale + metadata.scroll_offset_x;
-    let page_y = (device_y - metadata.offset_top) / scale + metadata.scroll_offset_y;
-    (page_x, page_y)
+    // dividing out the scale so clicks land correctly when the page is scrolled. Clamp at 0 so an
+    // out-of-viewport coordinate never dispatches as a negative page position.
+    let page_x = (device_x / scale + metadata.scroll_offset_x).max(0.0);
+    let page_y = ((device_y - metadata.offset_top) / scale + metadata.scroll_offset_y).max(0.0);
+    Some((page_x, page_y))
 }
 
 #[cfg(test)]
@@ -159,31 +164,58 @@ mod tests {
 
     #[test]
     fn maps_center_click_to_device_center_at_unit_scale() {
-        // A click at the center of a 500x400 panel should map to the center of a 1000x800 page.
-        let (x, y) = image_to_page_coords(&metadata(), 250.0, 200.0, 500.0, 400.0);
-        assert_eq!((x, y), (500.0, 400.0));
+        // A click at the center of a 500x400 image rect maps to the center of a 1000x800 page.
+        assert_eq!(
+            image_to_page_coords(&metadata(), 250.0, 200.0, 500.0, 400.0),
+            Some((500.0, 400.0))
+        );
     }
 
     #[test]
     fn applies_scroll_offset() {
         let mut metadata = metadata();
         metadata.scroll_offset_y = 300.0;
-        let (_, y) = image_to_page_coords(&metadata, 0.0, 0.0, 500.0, 400.0);
-        assert_eq!(y, 300.0);
+        assert_eq!(
+            image_to_page_coords(&metadata, 0.0, 0.0, 500.0, 400.0),
+            Some((0.0, 300.0))
+        );
     }
 
     #[test]
     fn divides_out_page_scale_factor() {
         let mut metadata = metadata();
         metadata.page_scale_factor = 2.0;
-        // Bottom-right of the panel maps to device (1000,800), then /2 for the page-scale zoom.
-        let (x, y) = image_to_page_coords(&metadata, 500.0, 400.0, 500.0, 400.0);
-        assert_eq!((x, y), (500.0, 400.0));
+        // Bottom-right of the rect maps to device (1000,800), then /2 for the page-scale zoom.
+        assert_eq!(
+            image_to_page_coords(&metadata, 500.0, 400.0, 500.0, 400.0),
+            Some((500.0, 400.0))
+        );
     }
 
     #[test]
-    fn zero_sized_image_does_not_divide_by_zero() {
-        let (x, y) = image_to_page_coords(&metadata(), 10.0, 10.0, 0.0, 0.0);
-        assert_eq!((x, y), (0.0, 0.0));
+    fn zero_sized_image_returns_none() {
+        assert_eq!(
+            image_to_page_coords(&metadata(), 10.0, 10.0, 0.0, 0.0),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_device_dimensions_return_none() {
+        let mut metadata = metadata();
+        metadata.device_width = 0.0;
+        assert_eq!(
+            image_to_page_coords(&metadata, 10.0, 10.0, 500.0, 400.0),
+            None
+        );
+    }
+
+    #[test]
+    fn out_of_viewport_offset_clamps_to_zero() {
+        // A large offset_top that would push page_y negative is clamped to 0, never dispatched negative.
+        let mut metadata = metadata();
+        metadata.offset_top = 1000.0;
+        let (_, page_y) = image_to_page_coords(&metadata, 0.0, 0.0, 500.0, 400.0).expect("maps");
+        assert_eq!(page_y, 0.0);
     }
 }
