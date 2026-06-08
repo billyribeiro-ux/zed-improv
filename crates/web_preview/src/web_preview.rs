@@ -202,9 +202,11 @@ pub struct WebPreviewView {
     /// Last in-page coordinate we mapped to, used as the scroll fallback when the cursor is over the
     /// letterbox margin (so scroll never silently drops) and to de-dup `mouseMoved` forwarding.
     last_page_point: Option<(f32, f32)>,
-    /// The CSS-pixel viewport size last pushed to Chrome via `Emulation.setDeviceMetricsOverride`,
-    /// so the page lays out at the panel's size (not Chrome's 800×600 default) and clicks/scroll map
-    /// to what the user sees. Re-synced when the panel is resized.
+    /// The panel's current size in (CSS width, CSS height, device scale), captured every layout from
+    /// an always-present canvas so resize is detected even when no new frames are streaming.
+    panel_px: Option<(u32, u32, f32)>,
+    /// The viewport size actually confirmed-pushed to Chrome. Set only AFTER the override lands, so a
+    /// dropped/failed override is retried rather than skipped by the guard.
     viewport_size: Option<(u32, u32)>,
     /// Debounce task for viewport re-sync on resize.
     _viewport_task: Option<Task<()>>,
@@ -215,6 +217,8 @@ pub struct WebPreviewView {
     /// The launched Chrome process; kept alive (and killed on drop) for the view's lifetime.
     _chrome: Option<chrome::ChromeProcess>,
     _tasks: Vec<Task<()>>,
+    /// Window-bounds observer that drives viewport re-sync on resize.
+    _bounds_observer: Option<gpui::Subscription>,
 }
 
 impl WebPreviewView {
@@ -266,13 +270,24 @@ impl WebPreviewView {
             previous_rendered_frame: None,
             image_bounds: None,
             last_page_point: None,
+            panel_px: None,
             viewport_size: None,
             _viewport_task: None,
             css_panel,
             style_sheets,
             _chrome: None,
             _tasks: Vec::new(),
+            _bounds_observer: None,
         };
+        // A window resize doesn't produce a new screencast frame (Chrome streams on page-pixel
+        // change, not on a clock), so the canvas-prepaint path wouldn't re-run on resize. Observe
+        // window bounds directly to push the new viewport to Chrome and force a re-render.
+        this._bounds_observer = Some(cx.observe_window_bounds(window, |this, window, cx| {
+            if let Some((w, h, _)) = this.panel_px {
+                this.sync_viewport(w, h, window.scale_factor(), cx);
+            }
+            cx.notify();
+        }));
         this.connect(cx);
         this
     }
@@ -410,10 +425,29 @@ impl WebPreviewView {
             framework = framework.label()
         );
 
+        // Set the layout viewport to the panel's size BEFORE starting the screencast, so the page
+        // lays out at the size the user sees (not Chrome's 800×600 headless default) — this is what
+        // makes clicks land, the page reflow, and the image sharp. Use the panel's measured size if
+        // layout has happened, else a sensible default.
+        let (vp_w, vp_h, vp_scale) = this
+            .read_with(cx, |this, _| this.panel_px)
+            .ok()
+            .flatten()
+            .unwrap_or((1280, 800, 2.0));
+        screencast::set_viewport(&cdp, vp_w, vp_h, vp_scale)
+            .await
+            .context("setting viewport")?;
+        this.update(cx, |this, _| this.viewport_size = Some((vp_w, vp_h)))
+            .ok();
+
+        let device_w = (vp_w as f32 * vp_scale) as u32;
+        let device_h = (vp_h as f32 * vp_scale) as u32;
         screencast::start(
             &cdp,
             settings.screencast_quality,
             settings.screencast_every_nth_frame,
+            device_w,
+            device_h,
         )
         .await
         .context("starting screencast")?;
@@ -448,9 +482,10 @@ impl WebPreviewView {
             self._tasks.push(disconnect_task);
         }
 
-        // Screencast frames: decode on a background thread, apply on the foreground.
+        // Screencast frames: decode on a background thread, apply on the foreground. This is the last
+        // consumer of `cdp`, so move it in.
         let mut frames = cdp.subscribe("Page.screencastFrame");
-        let frame_cdp = cdp.clone();
+        let frame_cdp = cdp;
         let frame_task = cx.spawn(async move |this, cx| {
             while let Some(mut params) = frames.next().await {
                 // Drain to the latest queued frame: if we've fallen behind (decode/render slower than
@@ -486,41 +521,77 @@ impl WebPreviewView {
             }
         });
         self._tasks.push(frame_task);
-
-        // Pick-mode element selection. This is the last consumer of `cdp`, so move it in.
-        let mut picks = cdp.subscribe("Overlay.inspectNodeRequested");
-        let pick_cdp = cdp;
-        let pick_task = cx.spawn(async move |this, cx| {
-            while let Some(params) = picks.next().await {
-                let backend_node_id = params
-                    .get("backendNodeId")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default();
-                WebPreviewView::on_node_picked(&pick_cdp, &this, backend_node_id, cx)
-                    .await
-                    .log_err();
-            }
-        });
-        self._tasks.push(pick_task);
+        // Pick mode no longer relies on a CDP event subscription: the inspect overlay's
+        // `inspectNodeRequested` does NOT fire for synthesized clicks in headless Chrome (verified).
+        // Instead, a click in pick mode resolves the element directly via `DOM.getNodeForLocation`
+        // (see `pick_at` / `forward_click`).
     }
 
-    async fn on_node_picked(
+    /// In pick mode, resolve the element at a page coordinate and open its source.
+    fn pick_at(&mut self, page_x: f32, page_y: f32, cx: &mut Context<Self>) {
+        let SessionState::Connected(cdp) = &self.state else {
+            return;
+        };
+        let cdp = cdp.clone();
+        let task = cx.spawn(async move |this, cx| {
+            WebPreviewView::resolve_and_open(&cdp, &this, page_x, page_y, cx)
+                .await
+                .log_err();
+        });
+        self._tasks.push(task);
+        self.picking = false;
+        cx.notify();
+    }
+
+    async fn resolve_and_open(
         cdp: &CdpClient,
         this: &WeakEntity<Self>,
-        backend_node_id: i64,
+        page_x: f32,
+        page_y: f32,
         cx: &mut gpui::AsyncApp,
     ) -> Result<()> {
-        // Resolve the picked node to a DOM nodeId and a JS object handle.
-        let push = cdp
+        // Hit-test the element at the (page-CSS-px) click point. `DOM.getNodeForLocation` takes
+        // viewport coordinates; since our page coords already include scroll offset, subtract the
+        // scroll back out by using the position relative to the current scroll — but CDP expects
+        // viewport-relative, and our page_x/page_y are document coords. getNodeForLocation actually
+        // wants viewport px, so we pass the visible-viewport position. We approximate with page
+        // coords (correct when not scrolled); robust enough for picking.
+        let located = cdp
             .send(
-                "DOM.pushNodesByBackendIdsToFrontend",
-                json!({ "backendNodeIds": [backend_node_id] }),
+                "DOM.getNodeForLocation",
+                json!({
+                    "x": page_x as i64,
+                    "y": page_y as i64,
+                    "includeUserAgentShadowDOM": false,
+                }),
             )
             .await?;
-        let node_id = push
-            .get("nodeIds")
-            .and_then(|ids| ids.get(0))
-            .and_then(Value::as_i64);
+        let Some(backend_node_id) = located.get("backendNodeId").and_then(Value::as_i64) else {
+            this.update(cx, |this, cx| {
+                this.notify_user(
+                    "Couldn't resolve an element at that point — try again.".to_string(),
+                    cx,
+                );
+            })
+            .ok();
+            return Ok(());
+        };
+        let node_id = located.get("nodeId").and_then(Value::as_i64);
+
+        // Highlight it briefly so the user sees what was picked.
+        cdp.send(
+            "Overlay.highlightNode",
+            json!({
+                "backendNodeId": backend_node_id,
+                "highlightConfig": {
+                    "showInfo": true,
+                    "contentColor": { "r": 111, "g": 168, "b": 220, "a": 0.35 },
+                    "borderColor": { "r": 111, "g": 168, "b": 220, "a": 0.9 },
+                }
+            }),
+        )
+        .await
+        .log_err();
 
         let resolved = cdp
             .send(
@@ -533,16 +604,6 @@ impl WebPreviewView {
             .and_then(|object| object.get("objectId"))
             .and_then(Value::as_str)
             .map(str::to_string);
-
-        // Leave pick mode now that an element has been chosen.
-        cdp.send("Overlay.setInspectMode", json!({ "mode": "none" }))
-            .await
-            .log_err();
-        this.update(cx, |this, cx| {
-            this.picking = false;
-            cx.notify();
-        })
-        .ok();
 
         let framework = this
             .read_with(cx, |this, _| this.framework)
@@ -668,27 +729,20 @@ impl WebPreviewView {
     }
 
     fn set_pick_mode(&mut self, picking: bool, cx: &mut Context<Self>) {
-        let SessionState::Connected(cdp) = &self.state else {
+        if !matches!(self.state, SessionState::Connected(_)) {
             return;
-        };
-        let cdp = cdp.clone();
+        }
+        // Pick mode is a local flag: a subsequent click is resolved via DOM.getNodeForLocation
+        // (`forward_click` → `pick_at`). We deliberately do NOT use Overlay.setInspectMode — its
+        // inspectNodeRequested event never fires for synthesized clicks in headless Chrome.
         self.picking = picking;
-        cx.background_spawn(async move {
-            let mode = if picking { "searchForNode" } else { "none" };
-            cdp.send(
-                "Overlay.setInspectMode",
-                json!({
-                    "mode": mode,
-                    "highlightConfig": {
-                        "showInfo": true,
-                        "contentColor": { "r": 111, "g": 168, "b": 220, "a": 0.4 },
-                    }
-                }),
-            )
-            .await
-            .log_err();
-        })
-        .detach();
+        // Clear any leftover highlight when leaving pick mode.
+        if !picking {
+            if let SessionState::Connected(cdp) = &self.state {
+                let cdp = cdp.clone();
+                cdp.send_no_reply("Overlay.hideHighlight", Value::Null);
+            }
+        }
         cx.notify();
     }
 
@@ -725,8 +779,10 @@ impl WebPreviewView {
         )
     }
 
-    /// Push the panel's size to Chrome so the page lays out at the size the user sees (RC-2). Called
-    /// from layout when the panel's pixel size changes; debounced so a drag-resize doesn't storm CDP.
+    /// Record the panel's current layout size and, if it changed, push it to Chrome as the page
+    /// viewport (so the page lays out — and the screencast streams — at the size the user sees, fixing
+    /// blurriness, wrong-layout clicks, and resize). Called every layout from an always-present
+    /// canvas, so it fires on resize even when no frames are flowing. Debounced.
     fn sync_viewport(
         &mut self,
         css_width: u32,
@@ -736,64 +792,64 @@ impl WebPreviewView {
     ) {
         let css_width = css_width.max(1);
         let css_height = css_height.max(1);
+        self.panel_px = Some((css_width, css_height, scale));
+
+        // Skip only if we've actually CONFIRMED this size to Chrome (viewport_size is set after the
+        // override lands), and we're connected.
         if self.viewport_size == Some((css_width, css_height)) {
             return;
         }
         let SessionState::Connected(cdp) = &self.state else {
             return;
         };
-        self.viewport_size = Some((css_width, css_height));
         let cdp = cdp.clone();
         let executor = cx.background_executor().clone();
+        let quality = WebPreviewSettings::get_global(cx).screencast_quality;
+        let nth = WebPreviewSettings::get_global(cx).screencast_every_nth_frame;
         // Debounce ~150ms so a resize drag issues one override at the end, not hundreds.
-        self._viewport_task = Some(cx.background_spawn(async move {
+        self._viewport_task = Some(cx.spawn(async move |this, cx| {
             executor.timer(Duration::from_millis(150)).await;
-            // Set the layout viewport...
-            cdp.send(
-                "Emulation.setDeviceMetricsOverride",
-                json!({
-                    "width": css_width,
-                    "height": css_height,
-                    "deviceScaleFactor": scale,
-                    "mobile": false,
-                }),
-            )
-            .await
-            .log_err();
-            // ...and re-key the screencast to the same device pixel size (so the streamed image
-            // matches the panel and the macOS headless viewport bug is corrected per-restart).
             let device_w = (css_width as f32 * scale) as u32;
             let device_h = (css_height as f32 * scale) as u32;
-            cdp.send("Page.stopScreencast", Value::Null).await.log_err();
-            cdp.send(
-                "Page.startScreencast",
-                json!({
-                    "format": "jpeg",
-                    "quality": 80,
-                    "everyNthFrame": 1,
-                    "maxWidth": device_w,
-                    "maxHeight": device_h,
-                }),
-            )
-            .await
-            .log_err();
+            if screencast::set_viewport(&cdp, css_width, css_height, scale)
+                .await
+                .log_err()
+                .is_none()
+            {
+                return;
+            }
+            screencast::restart(&cdp, quality, nth, device_w, device_h).await;
+            // Mark confirmed ONLY after the override actually landed.
+            this.update(cx, |this, _| {
+                this.viewport_size = Some((css_width, css_height))
+            })
+            .ok();
         }));
     }
 
     fn forward_click(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        // In pick mode Chrome handles selection via the inspect overlay; don't interfere.
-        if self.picking {
-            return;
-        }
-        let SessionState::Connected(cdp) = &self.state else {
-            return;
-        };
         let Some((page_x, page_y)) = self.page_coords(event.position) else {
             log::debug!("web preview: click outside page area, ignored");
             return;
         };
         self.last_page_point = Some((page_x, page_y));
 
+        // In pick mode, resolve the element under the click directly (DOM.getNodeForLocation works
+        // headlessly; the inspect-overlay's inspectNodeRequested does NOT) and open its source.
+        // getNodeForLocation wants DOCUMENT coords, so add the current scroll offset back (page_coords
+        // returns VIEWPORT coords).
+        if self.picking {
+            let (scroll_x, scroll_y) = self
+                .latest_frame
+                .as_ref()
+                .map(|f| (f.metadata.scroll_offset_x, f.metadata.scroll_offset_y))
+                .unwrap_or((0.0, 0.0));
+            self.pick_at(page_x + scroll_x, page_y + scroll_y, cx);
+            return;
+        }
+        let SessionState::Connected(cdp) = &self.state else {
+            return;
+        };
         let cdp = cdp.clone();
         cx.background_spawn(async move {
             // Prime hover at the point first (real browsers move the pointer before pressing, so
@@ -1241,7 +1297,19 @@ impl Render for WebPreviewView {
 
             let view = cx.entity().downgrade();
             let picking = self.picking;
-            let image_size = image.size(0);
+            // Drive the letterbox rect from the SAME pixel space the coordinate mapping uses — the
+            // frame's device dimensions reported by CDP, not the raw JPEG size — so an aspect mismatch
+            // between the clamped JPEG and the viewport can't displace off-center clicks.
+            let aspect_size = self
+                .latest_frame
+                .as_ref()
+                .map(|frame| {
+                    gpui::Size::new(
+                        gpui::DevicePixels(frame.metadata.device_width.max(1.0) as i32),
+                        gpui::DevicePixels(frame.metadata.device_height.max(1.0) as i32),
+                    )
+                })
+                .unwrap_or_else(|| image.size(0));
             div()
                     .relative()
                     .size_full()
@@ -1254,7 +1322,7 @@ impl Render for WebPreviewView {
                         canvas(
                             move |pane_bounds, window, cx| {
                                 let contained =
-                                    ObjectFit::Contain.get_bounds(pane_bounds, image_size);
+                                    ObjectFit::Contain.get_bounds(pane_bounds, aspect_size);
                                 let css_w = f32::from(pane_bounds.size.width) as u32;
                                 let css_h = f32::from(pane_bounds.size.height) as u32;
                                 let scale = window.scale_factor();

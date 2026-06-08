@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use smallvec::SmallVec;
 use std::sync::Arc;
+use util::ResultExt as _;
 
 /// Metadata CDP sends alongside each screencast frame, describing how the captured bitmap maps onto
 /// the page. Used to translate clicks from panel space back to page CSS pixels.
@@ -39,20 +40,66 @@ pub struct DecodedFrame {
     pub metadata: FrameMetadata,
 }
 
-/// Begin streaming frames. The caller subscribes to `Page.screencastFrame` and feeds each event's
-/// params to [`decode_frame`], then acks via [`ack`].
-pub async fn start(cdp: &CdpClient, quality: u8, every_nth_frame: u32) -> Result<()> {
+/// Set the page's layout viewport (CSS px) and device scale, so the page lays out at the size the
+/// user sees rather than Chrome's headless 800×600 default. Awaited, so callers can gate the first
+/// frame on it landing.
+pub async fn set_viewport(
+    cdp: &CdpClient,
+    css_width: u32,
+    css_height: u32,
+    device_scale: f32,
+) -> Result<()> {
+    cdp.send(
+        "Emulation.setDeviceMetricsOverride",
+        json!({
+            "width": css_width.max(1),
+            "height": css_height.max(1),
+            "deviceScaleFactor": device_scale.max(1.0),
+            "mobile": false,
+        }),
+    )
+    .await
+    .context("Emulation.setDeviceMetricsOverride")?;
+    Ok(())
+}
+
+/// Begin streaming frames sized to the device-pixel dimensions of the viewport (so the streamed
+/// image is sharp on the panel, not an upscaled 800×600). The caller subscribes to
+/// `Page.screencastFrame`, decodes via [`decode_frame`], and acks via [`ack_no_reply`].
+pub async fn start(
+    cdp: &CdpClient,
+    quality: u8,
+    every_nth_frame: u32,
+    max_width: u32,
+    max_height: u32,
+) -> Result<()> {
     cdp.send(
         "Page.startScreencast",
         json!({
             "format": "jpeg",
             "quality": quality,
             "everyNthFrame": every_nth_frame,
+            "maxWidth": max_width.max(1),
+            "maxHeight": max_height.max(1),
         }),
     )
     .await
     .context("Page.startScreencast")?;
     Ok(())
+}
+
+/// Restart the screencast with new size bounds (after a viewport change). Best-effort.
+pub async fn restart(
+    cdp: &CdpClient,
+    quality: u8,
+    every_nth_frame: u32,
+    max_width: u32,
+    max_height: u32,
+) {
+    cdp.send("Page.stopScreencast", Value::Null).await.log_err();
+    start(cdp, quality, every_nth_frame, max_width, max_height)
+        .await
+        .log_err();
 }
 
 /// Acknowledge a received frame so Chrome sends the next one. Fire-and-forget: the ack has no
@@ -126,8 +173,7 @@ pub fn image_to_page_coords(
     }
 
     // The captured bitmap covers the device viewport (device_width x device_height) scaled to fit
-    // the image rect. Map the click into device space, then divide out the page scale factor and add
-    // the scroll offset to land on the page's CSS-pixel coordinate.
+    // the image rect. Map the click into device space, then divide out the page scale factor.
     let device_x = image_x / image_width * metadata.device_width;
     let device_y = image_y / image_height * metadata.device_height;
 
@@ -137,12 +183,13 @@ pub fn image_to_page_coords(
         1.0
     };
 
-    // Convert device px → CSS px first (divide out the page scale factor), THEN subtract
-    // `offset_top` (which CDP reports in CSS/DIP px, not device px) and add the scroll offset. Doing
-    // the subtraction in the right unit keeps clicks correct under pinch-zoom. Clamp at 0 so an
-    // out-of-viewport coordinate never dispatches as a negative page position.
-    let page_x = (device_x / scale + metadata.scroll_offset_x).max(0.0);
-    let page_y = (device_y / scale - metadata.offset_top + metadata.scroll_offset_y).max(0.0);
+    // Return VIEWPORT (CSS-px) coordinates — NOT document coordinates. `Input.dispatchMouseEvent`
+    // (click/scroll/move) expects viewport coords and applies scroll itself; adding the scroll offset
+    // here made every click/scroll wrong by `scrollY` once the page was scrolled (verified against
+    // real Chrome). `offset_top` (CSS px) accounts for a partially-captured top region. Callers that
+    // need document coords (e.g. `DOM.getNodeForLocation`) add `scroll_offset_*` themselves.
+    let page_x = (device_x / scale).max(0.0);
+    let page_y = (device_y / scale - metadata.offset_top).max(0.0);
     Some((page_x, page_y))
 }
 
@@ -171,12 +218,14 @@ mod tests {
     }
 
     #[test]
-    fn applies_scroll_offset() {
+    fn returns_viewport_coords_ignoring_scroll() {
+        // Result is VIEWPORT coordinates: scroll offset is NOT added (Input.dispatchMouseEvent
+        // applies scroll itself; adding it here makes clicks wrong once the page is scrolled).
         let mut metadata = metadata();
         metadata.scroll_offset_y = 300.0;
         assert_eq!(
             image_to_page_coords(&metadata, 0.0, 0.0, 500.0, 400.0),
-            Some((0.0, 300.0))
+            Some((0.0, 0.0))
         );
     }
 
