@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+
+# Checks that this machine can build and run the `web_preview` feature end-to-end:
+#   1. Metal shader toolchain (required to build the macOS GUI app at all)
+#   2. Google Chrome / Chromium (the preview drives an external Chrome over CDP)
+#   3. (optional) the dev server URL is reachable
+#
+# Usage:
+#   script/check-web-preview-env [DEV_SERVER_URL]
+#
+# Example:
+#   script/check-web-preview-env http://localhost:5173
+#
+# Exits non-zero if any required check fails, and prints exactly what to fix.
+
+set -uo pipefail
+
+URL="${1:-http://localhost:5173}"
+FAIL=0
+
+green() { printf '\033[32m%s\033[0m\n' "$1"; }
+red()   { printf '\033[31m%s\033[0m\n' "$1"; }
+yellow(){ printf '\033[33m%s\033[0m\n' "$1"; }
+
+echo "web_preview environment check"
+echo "============================="
+echo
+
+# ---------------------------------------------------------------------------
+# 1. Metal toolchain (only relevant on macOS; the GUI app won't build without it)
+# ---------------------------------------------------------------------------
+if [[ "$(uname)" == "Darwin" ]]; then
+  if ! xcrun -f metal >/dev/null 2>&1; then
+    red   "[FAIL] Metal compiler not found (xcrun -f metal failed)."
+    echo  "       The macOS app cannot build its shaders without it."
+    echo  "       Fix: install full Xcode (not just Command Line Tools), then:"
+    echo  "         sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+    echo  "         sudo xcodebuild -license accept"
+    FAIL=1
+  # The `metal` tool can resolve but still fail to RUN if the Metal Toolchain component
+  # (separately downloadable on Xcode 16+) isn't installed. Verify it actually executes.
+  elif ! echo '' | xcrun metal -x metal -c - -o /dev/null >/dev/null 2>&1; then
+    red   "[FAIL] Metal toolchain component is not installed (the 'metal' tool can't run)."
+    echo  "       Fix: download it (a few hundred MB), then re-run this check:"
+    echo  "         sudo xcodebuild -downloadComponent MetalToolchain"
+    FAIL=1
+  else
+    green "[ok]   Metal compiler usable: $(xcrun -f metal)"
+  fi
+else
+  yellow "[skip] Not macOS; Metal check skipped."
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 2. Chrome / Chromium (must match crates/web_preview/src/chrome.rs candidates)
+# ---------------------------------------------------------------------------
+CHROME=""
+case "$(uname)" in
+  Darwin)
+    CANDIDATES=(
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+      "/Applications/Chromium.app/Contents/MacOS/Chromium"
+      "google-chrome"
+      "chromium"
+    )
+    ;;
+  Linux)
+    CANDIDATES=(google-chrome google-chrome-stable chromium chromium-browser)
+    ;;
+  *)
+    CANDIDATES=(chrome chromium)
+    ;;
+esac
+
+for candidate in "${CANDIDATES[@]}"; do
+  if [[ "$candidate" == /* && -x "$candidate" ]]; then
+    CHROME="$candidate"
+    break
+  elif command -v "$candidate" >/dev/null 2>&1; then
+    CHROME="$(command -v "$candidate")"
+    break
+  fi
+done
+
+if [[ -n "$CHROME" ]]; then
+  green "[ok]   Chrome/Chromium found: $CHROME"
+else
+  red   "[FAIL] No Chrome or Chromium found in the locations web_preview searches."
+  echo  "       Fix: install Google Chrome, or set \`web_preview.chrome_path\` in Zed settings."
+  FAIL=1
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 3. Dev server reachability (optional — informational, not a hard failure)
+# ---------------------------------------------------------------------------
+if command -v curl >/dev/null 2>&1; then
+  if curl --silent --output /dev/null --max-time 3 "$URL"; then
+    green "[ok]   Dev server reachable at $URL"
+  else
+    yellow "[warn] Dev server NOT reachable at $URL"
+    echo   "       Start your dev server (e.g. \`npm run dev\`) before opening the preview,"
+    echo   "       or pass the right URL: script/check-web-preview-env <url>"
+  fi
+else
+  yellow "[skip] curl not found; can't check the dev server URL."
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+if [[ "$FAIL" -eq 0 ]]; then
+  green "All required checks passed. You can build and run the web preview:"
+  echo  "  cargo run    # then: command palette -> 'web preview: Open Web Preview'"
+  echo  "  (see crates/web_preview/MANUAL_TESTING.md for the full walkthrough)"
+  exit 0
+else
+  red "One or more required checks failed; fix the items above before running the preview."
+  exit 1
+fi
