@@ -11,16 +11,21 @@ use async_tungstenite::WebSocketStream;
 use async_tungstenite::tokio::ConnectStream;
 use async_tungstenite::tungstenite::Message as WebSocketMessage;
 use collections::HashMap;
-use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
+use futures::{FutureExt as _, StreamExt as _};
 use gpui::{AsyncApp, BackgroundExecutor, Task};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 type EventSubscribers = Arc<Mutex<HashMap<String, Vec<mpsc::UnboundedSender<Value>>>>>;
+
+/// Per-request timeout. Guards against a wedged-but-alive Chrome (a hung renderer that neither
+/// replies nor closes the socket) hanging an awaiter — and thus session setup — forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A connected CDP session. Cloneable: all clones share the same underlying socket and dispatch
 /// state, so the client can be handed to multiple feature modules (pick mode, CSS panel, …).
@@ -34,6 +39,12 @@ struct CdpInner {
     pending: PendingMap,
     subscribers: EventSubscribers,
     outgoing: mpsc::UnboundedSender<WebSocketMessage>,
+    executor: BackgroundExecutor,
+    /// Set once the read pump terminates (socket closed / errored). After this, `send` fails fast
+    /// and subscriber streams have been closed so their `.next()` yields `None`.
+    closed: Arc<AtomicBool>,
+    /// Fires once when the connection closes, for disconnect detection by the view.
+    on_closed: Mutex<Option<oneshot::Receiver<()>>>,
     // Keeps the read/write pump tasks alive for the lifetime of the client. Dropping the client
     // drops these, which tears down the connection.
     _pump: Arc<[Task<()>; 2]>,
@@ -61,6 +72,8 @@ impl CdpClient {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::default()));
         let subscribers: EventSubscribers = Arc::new(Mutex::new(HashMap::default()));
         let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<WebSocketMessage>();
+        let closed = Arc::new(AtomicBool::new(false));
+        let (closed_tx, closed_rx) = oneshot::channel();
 
         let write_task = executor.spawn(async move {
             while let Some(message) = outgoing_rx.next().await {
@@ -74,6 +87,7 @@ impl CdpClient {
         let read_task = executor.spawn({
             let pending = pending.clone();
             let subscribers = subscribers.clone();
+            let closed = closed.clone();
             async move {
                 while let Some(message) = read.next().await {
                     match message {
@@ -88,11 +102,15 @@ impl CdpClient {
                         }
                     }
                 }
-                // Connection ended: fail any in-flight requests so awaiters don't hang forever.
-                let mut pending = pending.lock();
-                for (_, sender) in pending.drain() {
+                // Connection ended. Mark closed, fail in-flight requests, and drop all subscriber
+                // senders so their receivers' `.next()` yields `None` (stopping the frame/pick loops
+                // from hanging forever), then signal disconnection.
+                closed.store(true, Ordering::SeqCst);
+                for (_, sender) in pending.lock().drain() {
                     let _ = sender.send(Err(anyhow!("CDP connection closed")));
                 }
+                subscribers.lock().clear();
+                let _ = closed_tx.send(());
             }
         });
 
@@ -102,14 +120,34 @@ impl CdpClient {
                 pending,
                 subscribers,
                 outgoing: outgoing_tx,
+                executor,
+                closed,
+                on_closed: Mutex::new(Some(closed_rx)),
                 _pump: Arc::new([read_task, write_task]),
             }),
         }
     }
 
+    /// Whether the connection has closed (socket dropped, Chrome exited, etc.).
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::SeqCst)
+    }
+
+    /// Take the one-shot that fires when the connection closes. Returns `None` if already taken.
+    /// The view awaits this to flip into a disconnected state and offer reconnect.
+    pub fn take_closed_signal(&self) -> Option<oneshot::Receiver<()>> {
+        self.inner.on_closed.lock().take()
+    }
+
     /// Send a CDP method call and await its result. `params` is the raw params object (use
     /// `serde_json::json!({...})`, or `Value::Null` for none).
+    ///
+    /// Fails fast if the connection is already closed, and times out after [`REQUEST_TIMEOUT`] so a
+    /// wedged-but-alive browser can't hang the caller forever.
     pub async fn send(&self, method: &str, params: Value) -> Result<Value> {
+        if self.is_closed() {
+            bail!("CDP connection is closed");
+        }
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.inner.pending.lock().insert(id, tx);
@@ -121,7 +159,16 @@ impl CdpClient {
             .unbounded_send(WebSocketMessage::Text(text.into()))
             .map_err(|_| anyhow!("CDP connection is closed"))?;
 
-        rx.await.context("CDP response channel dropped")?
+        let mut timer = self.inner.executor.timer(REQUEST_TIMEOUT).fuse();
+        let mut response = rx.fuse();
+        futures::select! {
+            result = response => result.context("CDP response channel dropped")?,
+            _ = timer => {
+                // Reclaim the pending slot so it doesn't leak, then report the timeout.
+                self.inner.pending.lock().remove(&id);
+                bail!("CDP request '{method}' timed out after {REQUEST_TIMEOUT:?}");
+            }
+        }
     }
 
     /// Subscribe to a CDP event by method name (e.g. `"Overlay.inspectNodeRequested"`). Returns a

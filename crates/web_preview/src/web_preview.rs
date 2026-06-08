@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use ui::{Icon, IconButton, IconName, IconSize, Label, Tooltip, prelude::*};
 use util::ResultExt as _;
-use web_preview_settings::WebPreviewSettings;
+use web_preview_settings::{DEFAULT_REMOTE_DEBUGGING_PORT, WebPreviewSettings};
 use workspace::item::{Item, ItemEvent};
 use workspace::{AppState, OpenOptions, Workspace};
 
@@ -55,6 +55,27 @@ gpui::actions!(
 
 /// User-facing product name for the panel.
 const PRODUCT_NAME: &str = "Looking Glass";
+
+/// Turn a connection-failure error chain into a single actionable remediation line, so the user
+/// knows *how* to fix it rather than reading a raw anyhow chain.
+fn remediation_for(error: &str) -> String {
+    let lower = error.to_lowercase();
+    if lower.contains("dev server") || lower.contains("waiting for dev server") {
+        "Your dev server isn't responding. Start it (e.g. `npm run dev`) and check the URL in \
+         settings (`web_preview.url`), then Retry."
+            .to_string()
+    } else if lower.contains("chrome") || lower.contains("chromium") {
+        "Couldn't launch Chrome. Install Google Chrome, or set `web_preview.chrome_path` in \
+         settings, then Retry."
+            .to_string()
+    } else if lower.contains("port") || lower.contains("debugging") {
+        "Couldn't reach Chrome's debugging port. Another process may be using it — change \
+         `web_preview.remote_debugging_port` in settings, then Retry."
+            .to_string()
+    } else {
+        error.to_string()
+    }
+}
 
 pub fn init(app_state: Arc<AppState>, cx: &mut App) {
     WebPreviewSettings::register(cx);
@@ -84,7 +105,10 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
 enum SessionState {
     Connecting,
     Connected(CdpClient),
+    /// Initial connection never succeeded (dev server down, Chrome missing, …).
     Failed(SharedString),
+    /// A previously-live connection was lost (Chrome closed, dev server restarted, socket dropped).
+    Disconnected,
 }
 
 pub struct WebPreviewView {
@@ -175,7 +199,17 @@ impl WebPreviewView {
 
     /// Establish the full session: wait for the dev server, launch Chrome, connect CDP, enable the
     /// domains we need, detect the framework, and start streaming frames into the panel.
+    ///
+    /// Resets prior session state first, so this also serves reconnect: any old event-loop tasks,
+    /// Chrome process, and frame are torn down before a fresh attempt.
     fn connect(&mut self, cx: &mut Context<Self>) {
+        self._tasks.clear();
+        self._chrome = None;
+        self.latest_frame = None;
+        self.framework = Framework::Unknown;
+        self.state = SessionState::Connecting;
+        cx.notify();
+
         let settings = WebPreviewSettings::get_global(cx).clone();
         let http_client: Arc<dyn http_client::HttpClient> = self.app_state.client.http_client();
         let executor = cx.background_executor().clone();
@@ -197,6 +231,11 @@ impl WebPreviewView {
         self._tasks.push(task);
     }
 
+    /// Re-establish the session from scratch (used by the Retry/Reconnect affordance).
+    fn reconnect(&mut self, cx: &mut Context<Self>) {
+        self.connect(cx);
+    }
+
     async fn establish_session(
         settings: WebPreviewSettings,
         http_client: Arc<dyn http_client::HttpClient>,
@@ -214,11 +253,20 @@ impl WebPreviewView {
         .context("waiting for dev server")?;
 
         let chrome_path = chrome::locate_chrome(settings.chrome_path.as_deref())?;
-        let user_data_dir = std::env::temp_dir().join("zed-web-preview-chrome");
+        // Unique profile dir + port per session so two panels (or a stale browser) never collide.
+        // A non-default configured port is treated as an explicit override; otherwise pick a free one.
+        let session_key = this.entity_id().as_u64();
+        let user_data_dir =
+            std::env::temp_dir().join(format!("zed-web-preview-chrome-{session_key}"));
+        let port = if settings.remote_debugging_port == DEFAULT_REMOTE_DEBUGGING_PORT {
+            chrome::free_port()?
+        } else {
+            settings.remote_debugging_port
+        };
         let process = chrome::launch(
             chrome_path,
             &settings.url,
-            settings.remote_debugging_port,
+            port,
             user_data_dir,
             http_client,
             executor,
@@ -270,6 +318,24 @@ impl WebPreviewView {
     /// view's own context so the spawned tasks can update `self`.
     fn spawn_event_loops(&mut self, cdp: CdpClient, cx: &mut Context<Self>) {
         // (Stylesheet headers are subscribed earlier, before `CSS.enable`, in `establish_session`.)
+
+        // Disconnect watcher: when the CDP socket closes (Chrome exits, dev server restarts, network
+        // drop), flip the view into `Disconnected` so the header pill turns red and the preview
+        // offers a Reconnect affordance instead of sitting frozen on a stale "Live" frame.
+        if let Some(closed) = cdp.take_closed_signal() {
+            let disconnect_task = cx.spawn(async move |this, cx| {
+                let _ = closed.await;
+                this.update(cx, |this, cx| {
+                    if matches!(this.state, SessionState::Connected(_)) {
+                        this.state = SessionState::Disconnected;
+                        this.picking = false;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            });
+            self._tasks.push(disconnect_task);
+        }
 
         // Screencast frames: decode on a background thread, apply on the foreground.
         let mut frames = cdp.subscribe("Page.screencastFrame");
@@ -562,7 +628,8 @@ impl WebPreviewView {
             SessionState::Connected(_) => {
                 (format!("Live · {}", self.framework.label()), Color::Success)
             }
-            SessionState::Failed(_) => ("Disconnected".to_string(), Color::Error),
+            SessionState::Failed(_) => ("Couldn't connect".to_string(), Color::Error),
+            SessionState::Disconnected => ("Disconnected".to_string(), Color::Error),
         };
 
         h_flex()
@@ -620,15 +687,27 @@ impl WebPreviewView {
     }
 
     /// The empty / onboarding state shown before the first frame arrives.
-    fn render_onboarding(&self, cx: &Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors();
+    fn render_onboarding(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
 
+        // Failed/Disconnected states get a tailored, actionable headline + a Retry affordance.
+        let recoverable = matches!(
+            self.state,
+            SessionState::Failed(_) | SessionState::Disconnected
+        );
         let (headline, detail): (SharedString, SharedString) = match &self.state {
             SessionState::Connecting => (
                 "Connecting to your app…".into(),
                 "Launching a browser and attaching to your dev server.".into(),
             ),
-            SessionState::Failed(error) => ("Couldn't connect".into(), error.clone()),
+            SessionState::Failed(error) => {
+                ("Couldn't connect".into(), remediation_for(error).into())
+            }
+            SessionState::Disconnected => (
+                "Connection lost".into(),
+                "The browser or dev server stopped. Reconnect to pick up where you left off."
+                    .into(),
+            ),
             SessionState::Connected(_) => (
                 "Waiting for the first frame…".into(),
                 "Your app is connected. The preview will appear in a moment.".into(),
@@ -676,16 +755,24 @@ impl WebPreviewView {
                         ),
                     ),
             )
-            .child(
-                v_flex()
-                    .gap_1p5()
-                    .child(step("1", "Start your dev server (e.g. npm run dev)"))
-                    .child(step(
-                        "2",
-                        "Pick mode (⌘⇧I) → click an element to open its source",
-                    ))
-                    .child(step("3", "Edit its CSS on the right — changes apply live")),
-            )
+            .when(recoverable, |this| {
+                this.child(
+                    ui::Button::new("web-preview-retry", "Retry")
+                        .on_click(cx.listener(|this, _, _window, cx| this.reconnect(cx))),
+                )
+            })
+            .when(!recoverable, |this| {
+                this.child(
+                    v_flex()
+                        .gap_1p5()
+                        .child(step("1", "Start your dev server (e.g. npm run dev)"))
+                        .child(step(
+                            "2",
+                            "Pick mode (⌘⇧I) → click an element to open its source",
+                        ))
+                        .child(step("3", "Edit its CSS on the right — changes apply live")),
+                )
+            })
             .into_any_element()
     }
 

@@ -78,12 +78,23 @@ pub fn locate_chrome(explicit_path: Option<&str>) -> Result<PathBuf> {
     )
 }
 
+/// Allocate a free TCP port by binding to port 0 and reading back the assigned port. There is an
+/// inherent (small) race between releasing this and Chrome binding it, but it is far more robust
+/// than a fixed port that collides with a stale or second browser instance.
+pub fn free_port() -> Result<u16> {
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).context("binding to find a free port")?;
+    let port = listener.local_addr().context("reading bound port")?.port();
+    Ok(port)
+}
+
 /// Launch Chrome at `url` with remote debugging enabled, then discover the page's CDP websocket URL.
 ///
 /// `user_data_dir` isolates this browser session from the user's normal profile (required for
-/// remote debugging to attach reliably). `port` of 0 lets Chrome pick a free port, which we then
-/// read back from the DevToolsActivePort file is not used here — instead we require a fixed port so
-/// `/json/list` is reachable at a known address.
+/// remote debugging to attach reliably) and must be **unique per session** — Chrome keys its
+/// single-instance behavior off the profile dir, so reusing a dir makes a second launch forward to
+/// the existing browser and attach to the wrong instance. `port` should likewise be a free port
+/// (see [`free_port`]) so `/json/list` reaches this browser and not a stale one still bound to it.
 pub async fn launch(
     chrome_path: PathBuf,
     url: &str,

@@ -1,5 +1,14 @@
 use settings::{RegisterSetting, Settings};
 
+/// Default dev-server URL when unset. Single source of truth — also referenced in the settings
+/// content doc comment and `script/check-web-preview-env`.
+pub const DEFAULT_URL: &str = "http://localhost:5173";
+
+/// Default Chrome remote-debugging port. A value equal to this is treated as "auto": the session
+/// allocates a free port instead, so two panels never collide. Any other value is an explicit
+/// override that is used verbatim.
+pub const DEFAULT_REMOTE_DEBUGGING_PORT: u16 = 9222;
+
 /// Resolved settings for the in-editor web app preview.
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct WebPreviewSettings {
@@ -17,11 +26,11 @@ impl Settings for WebPreviewSettings {
         WebPreviewSettings {
             url: web_preview
                 .and_then(|settings| settings.url.clone())
-                .unwrap_or_else(|| "http://localhost:5173".to_string()),
+                .unwrap_or_else(|| DEFAULT_URL.to_string()),
             chrome_path: web_preview.and_then(|settings| settings.chrome_path.clone()),
             remote_debugging_port: web_preview
                 .and_then(|settings| settings.remote_debugging_port)
-                .unwrap_or(9222),
+                .unwrap_or(DEFAULT_REMOTE_DEBUGGING_PORT),
         }
     }
 }
