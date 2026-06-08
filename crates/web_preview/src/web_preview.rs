@@ -14,6 +14,7 @@ mod cdp;
 mod chrome;
 mod css_panel;
 mod dev_server;
+mod path_resolve;
 mod screencast;
 mod source_map;
 mod web_preview_settings;
@@ -32,7 +33,6 @@ use screencast::DecodedFrame;
 use serde_json::{Value, json};
 use settings::Settings as _;
 use source_map::{Framework, Resolution, SourceLocation};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use ui::{Icon, IconButton, IconName, IconSize, Label, Tooltip, prelude::*};
@@ -55,6 +55,9 @@ gpui::actions!(
 
 /// User-facing product name for the panel.
 const PRODUCT_NAME: &str = "Looking Glass";
+
+/// Marker type for deduplicating Looking Glass toasts.
+struct WebPreviewNotice;
 
 /// Turn a connection-failure error chain into a single actionable remediation line, so the user
 /// knows *how* to fix it rather than reading a raw anyhow chain.
@@ -425,6 +428,10 @@ impl WebPreviewView {
         let framework = this
             .read_with(cx, |this, _| this.framework)
             .unwrap_or(Framework::Unknown);
+        // Recover from an early probe (ran before hydration) or an SPA route change by re-detecting
+        // when we still think the framework is Unknown.
+        let framework = source_map::detect_framework_if_unknown(cdp, framework).await;
+        this.update(cx, |this, _| this.framework = framework).ok();
 
         if let Some(object_id) = object_id {
             let resolution = source_map::resolve(cdp, framework, &object_id).await?;
@@ -456,15 +463,35 @@ impl WebPreviewView {
     fn handle_resolution(&mut self, resolution: Resolution, cx: &mut Context<Self>) {
         match resolution {
             Resolution::Source(location) => self.open_source(location, cx),
-            Resolution::SelectorOnly { selector } => {
-                log::info!("no deterministic source for element; selector: {selector}");
+            Resolution::SelectorOnly { selector, hint } => {
+                let message = hint.unwrap_or_else(|| {
+                    "No source mapping for this element — its styles are loaded on the right."
+                        .to_string()
+                });
+                log::info!("{message} (selector: {selector})");
+                self.notify_user(message, cx);
             }
         }
     }
 
+    /// Surface a short, transient message to the user via a workspace toast.
+    fn notify_user(&self, message: String, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    workspace::Toast::new(
+                        workspace::notifications::NotificationId::unique::<WebPreviewNotice>(),
+                        message,
+                    ),
+                    cx,
+                );
+            })
+            .ok();
+    }
+
     /// Open the resolved source file at the exact line/column in the workspace.
     fn open_source(&mut self, location: SourceLocation, cx: &mut Context<Self>) {
-        let Some(abs_path) = self.resolve_abs_path(&location.file, cx) else {
+        let Some(abs_path) = path_resolve::resolve(&self.project, &location.file, cx) else {
             log::warn!("could not locate {} in any worktree", location.file);
             return;
         };
@@ -496,19 +523,6 @@ impl WebPreviewView {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
-    }
-
-    /// Join a framework-reported (project-relative) file path to whichever visible worktree contains
-    /// it, returning an absolute path that exists on disk.
-    fn resolve_abs_path(&self, file: &str, cx: &App) -> Option<PathBuf> {
-        let relative = PathBuf::from(file);
-        for worktree in self.project.read(cx).visible_worktrees(cx) {
-            let candidate = worktree.read(cx).abs_path().join(&relative);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-        None
     }
 
     fn toggle_pick_mode(&mut self, cx: &mut Context<Self>) {

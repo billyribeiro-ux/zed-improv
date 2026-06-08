@@ -299,7 +299,7 @@ impl CssPanel {
             .cloned();
         match header {
             Some(header) if header.is_writable_source() => {
-                match source_url_to_abs_path(&self.project, &header.source_url, cx) {
+                match crate::path_resolve::resolve(&self.project, &header.source_url, cx) {
                     Some(path) => WriteRoute::Source(path),
                     None => WriteRoute::Agent,
                 }
@@ -611,35 +611,6 @@ fn parse_edit_target(style: &Value) -> Option<EditTarget> {
         selector: None,
         original_css: declaration_text(style),
     })
-}
-
-/// Map a stylesheet `sourceURL` (e.g. `http://localhost:5173/src/app.css`) to an absolute path in a
-/// visible worktree, by matching the URL's path tail against worktree files.
-fn source_url_to_abs_path(
-    project: &Entity<Project>,
-    source_url: &str,
-    cx: &App,
-) -> Option<PathBuf> {
-    let path_part = source_url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(source_url);
-    let path_part = path_part.split(['?', '#']).next().unwrap_or(path_part);
-    // Drop the leading host segment if present (`localhost:5173/src/app.css` → `src/app.css`).
-    let relative = path_part
-        .split_once('/')
-        .map(|(_, rest)| rest)
-        .unwrap_or(path_part)
-        .trim_start_matches('/');
-
-    let relative = PathBuf::from(relative);
-    for worktree in project.read(cx).visible_worktrees(cx) {
-        let candidate = worktree.read(cx).abs_path().join(&relative);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
 }
 
 /// Compose the prompt sent to the agent for non-deterministic write-back.

@@ -4,10 +4,15 @@
 //! resolve the exact `file:line:column` deterministically, using the framework's own dev-mode
 //! source metadata.
 //!
-//! v1 supports Svelte via the compiler's native `__svelte_meta.loc` property, which Svelte attaches
-//! to every DOM element in dev mode (`{ file, line, column, char }`). It is a *JavaScript property*
-//! on the node, not an HTML attribute, so we read it with `Runtime.callFunctionOn`. React (fiber
-//! `__source`) and Vue (`data-v-inspector`) are deferred.
+//! Supported frameworks:
+//! - **Svelte** via the compiler's native `__svelte_meta.loc` property (a *JavaScript property* on
+//!   the node, read with `Runtime.callFunctionOn`). Note: `loc` is emitted *after* preprocessors
+//!   run and is not mapped back through their sourcemaps, so for `<script lang="ts">`, MDsveX, or
+//!   markup-level PostCSS the line can be offset from the on-disk file. Exact for unpreprocessed
+//!   components, approximate for preprocessed ones.
+//! - **React** via the fiber `__source` / `_debugSource`. Best-effort: stock Vite + React 19 no
+//!   longer emits it, so this can fall back to selector-only with a hint.
+//! - **Vue** via the `data-v-inspector` attribute (`vite-plugin-vue-inspector`).
 
 use crate::cdp::CdpClient;
 use anyhow::{Context as _, Result};
@@ -51,25 +56,40 @@ pub struct SourceLocation {
 pub enum Resolution {
     /// Deterministic source location.
     Source(SourceLocation),
-    /// No source metadata found; a stable selector for the element (selector-only mode).
-    SelectorOnly { selector: String },
+    /// No source metadata found; a stable selector for the element (selector-only mode). `hint`, if
+    /// present, explains *why* mapping failed and how to enable it (e.g. a missing dev plugin).
+    SelectorOnly {
+        selector: String,
+        hint: Option<String>,
+    },
 }
 
-/// Detect the client framework by probing for runtime markers. Run once per session after connect.
+/// Detect the client framework by probing for runtime markers.
 ///
 /// We pick the framework whose *dev source metadata* we can actually read, in priority order:
-/// Svelte (`__svelte_meta` on nodes), then Vue (`data-v-inspector` attribute from
-/// `vite-plugin-vue-inspector`), then React (a `__reactFiber$*` key on nodes). The probe returns a
-/// string so a single round-trip distinguishes all three.
+/// Svelte (`__svelte_meta` on nodes), then Vue (`data-v-inspector` from `vite-plugin-vue-inspector`),
+/// then React (a `__reactFiber$*` key on nodes or the React DevTools global hook).
+///
+/// Cost-bounded: it checks cheap global markers first, then scans at most `MAX_SCAN` elements (a
+/// no-marker page — not-yet-hydrated, prod build, plain HTML — must not block the page's main thread
+/// enumerating every node's inherited keys). Because detection depends on hydration having run, it
+/// may return `Unknown` if probed too early; callers should re-probe on `Unknown` (see
+/// [`detect_framework_if_unknown`]).
 pub async fn detect_framework(cdp: &CdpClient) -> Framework {
     let expression = r#"
         (() => {
+            const MAX_SCAN = 2000;
+            // Cheap global markers first.
+            if (window.__svelte) {
+                // window.__svelte exists for Svelte 5 but doesn't confirm dev source metadata.
+            }
+            if (document.querySelector('[data-v-inspector]')) return 'vue';
             const all = document.querySelectorAll('*');
-            let sawReact = false;
-            for (let i = 0; i < all.length; i++) {
+            const limit = Math.min(all.length, MAX_SCAN);
+            let sawReact = !!window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+            for (let i = 0; i < limit; i++) {
                 const el = all[i];
                 if (el.__svelte_meta) return 'svelte';
-                if (el.hasAttribute && el.hasAttribute('data-v-inspector')) return 'vue';
                 if (!sawReact) {
                     for (const key in el) {
                         if (key.startsWith('__reactFiber$')) { sawReact = true; break; }
@@ -89,6 +109,16 @@ pub async fn detect_framework(cdp: &CdpClient) -> Framework {
     }
 }
 
+/// Re-run detection only if the current framework is `Unknown`. Used at pick time to recover from an
+/// early probe that ran before the app hydrated, or after navigating to a differently-built route.
+pub async fn detect_framework_if_unknown(cdp: &CdpClient, current: Framework) -> Framework {
+    if current == Framework::Unknown {
+        detect_framework(cdp).await
+    } else {
+        current
+    }
+}
+
 /// Resolve a picked node (identified by its `Runtime.RemoteObject` `objectId`) to source.
 pub async fn resolve(cdp: &CdpClient, framework: Framework, object_id: &str) -> Result<Resolution> {
     let function = match framework {
@@ -98,6 +128,7 @@ pub async fn resolve(cdp: &CdpClient, framework: Framework, object_id: &str) -> 
         Framework::Unknown => {
             return Ok(Resolution::SelectorOnly {
                 selector: selector_for(cdp, object_id).await.unwrap_or_default(),
+                hint: None,
             });
         }
     };
@@ -107,10 +138,29 @@ pub async fn resolve(cdp: &CdpClient, framework: Framework, object_id: &str) -> 
         return Ok(Resolution::Source(location));
     }
 
-    // Deterministic metadata missing (e.g. plugin not installed / prod build): degrade gracefully.
+    // Detected the framework but found no source metadata — give a framework-specific reason.
     Ok(Resolution::SelectorOnly {
         selector: selector_for(cdp, object_id).await.unwrap_or_default(),
+        hint: Some(missing_metadata_hint(framework)),
     })
+}
+
+/// Explain why a detected framework yielded no source metadata, and how to enable it.
+fn missing_metadata_hint(framework: Framework) -> String {
+    match framework {
+        Framework::React => "No React source metadata for this element. Stock Vite + React 19 \
+            doesn't emit it — add a click-to-component setup or the classic JSX-source transform."
+            .to_string(),
+        Framework::Vue => "No Vue source metadata. Enable `vite-plugin-vue-inspector` in your dev \
+            config to map elements to `.vue` files."
+            .to_string(),
+        Framework::Svelte => {
+            "No Svelte source metadata for this element (it may be a non-component \
+            node, or built without dev metadata)."
+                .to_string()
+        }
+        Framework::Unknown => String::new(),
+    }
 }
 
 /// Reads Svelte's native `__svelte_meta.loc`, walking ancestors until one carries it.
