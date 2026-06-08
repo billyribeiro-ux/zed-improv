@@ -61,6 +61,49 @@ const PRODUCT_NAME: &str = "Looking Glass";
 /// Marker type for deduplicating Looking Glass toasts.
 struct WebPreviewNotice;
 
+/// Map a GPUI keystroke to the CDP `dispatchKeyEvent` fields `(key, code, windowsVirtualKeyCode,
+/// text)`. `text` is `Some` for printable characters (which insert text) and `None` for control keys.
+fn key_to_cdp(ks: &gpui::Keystroke) -> (String, String, u32, Option<String>) {
+    // Non-printable / named keys → explicit DOM key/code/virtual-key-code. text is None.
+    let named: Option<(&str, &str, u32)> = match ks.key.as_str() {
+        "enter" => Some(("Enter", "Enter", 13)),
+        "tab" => Some(("Tab", "Tab", 9)),
+        "backspace" => Some(("Backspace", "Backspace", 8)),
+        "delete" => Some(("Delete", "Delete", 46)),
+        "escape" => Some(("Escape", "Escape", 27)),
+        "up" => Some(("ArrowUp", "ArrowUp", 38)),
+        "down" => Some(("ArrowDown", "ArrowDown", 40)),
+        "left" => Some(("ArrowLeft", "ArrowLeft", 37)),
+        "right" => Some(("ArrowRight", "ArrowRight", 39)),
+        "home" => Some(("Home", "Home", 36)),
+        "end" => Some(("End", "End", 35)),
+        "pageup" => Some(("PageUp", "PageUp", 33)),
+        "pagedown" => Some(("PageDown", "PageDown", 34)),
+        "space" => Some((" ", "Space", 32)),
+        _ => None,
+    };
+    if let Some((key, code, vk)) = named {
+        return (key.to_string(), code.to_string(), vk, None);
+    }
+
+    // Printable: use the character the OS produced (respects shift/layout). Derive a plausible
+    // `code` and virtual-key-code for single ASCII letters/digits.
+    let text = ks.key_char.clone().filter(|c| !c.is_empty());
+    let key = text.clone().unwrap_or_else(|| ks.key.clone());
+    let first = key.chars().next().unwrap_or('\0');
+    let (code, vk) = if first.is_ascii_alphabetic() {
+        (
+            format!("Key{}", first.to_ascii_uppercase()),
+            first.to_ascii_uppercase() as u32,
+        )
+    } else if first.is_ascii_digit() {
+        (format!("Digit{first}"), first as u32)
+    } else {
+        (String::new(), first as u32)
+    };
+    (key, code, vk, text)
+}
+
 /// Classify a session-failure error into a bounded stage label for telemetry. Returns a fixed set
 /// of strings (never raw error text) so the telemetry label cardinality stays bounded.
 fn failure_stage(error: &anyhow::Error) -> &'static str {
@@ -153,8 +196,18 @@ pub struct WebPreviewView {
     /// (mirrors `livekit_client::RemoteVideoTrackView`).
     current_rendered_frame: Option<Arc<gpui::RenderImage>>,
     previous_rendered_frame: Option<Arc<gpui::RenderImage>>,
-    /// Bounds of the rendered preview image, captured each frame for click→page coordinate mapping.
+    /// Bounds of the *contained* (letterboxed) preview image, captured each layout for click→page
+    /// coordinate mapping. Kept lock-step with where `img` actually paints.
     image_bounds: Option<Bounds<Pixels>>,
+    /// Last in-page coordinate we mapped to, used as the scroll fallback when the cursor is over the
+    /// letterbox margin (so scroll never silently drops) and to de-dup `mouseMoved` forwarding.
+    last_page_point: Option<(f32, f32)>,
+    /// The CSS-pixel viewport size last pushed to Chrome via `Emulation.setDeviceMetricsOverride`,
+    /// so the page lays out at the panel's size (not Chrome's 800×600 default) and clicks/scroll map
+    /// to what the user sees. Re-synced when the panel is resized.
+    viewport_size: Option<(u32, u32)>,
+    /// Debounce task for viewport re-sync on resize.
+    _viewport_task: Option<Task<()>>,
     css_panel: Entity<CssPanel>,
     /// Shared `styleSheetId` → header map, populated from `CSS.styleSheetAdded`; used by the CSS
     /// panel to decide whether an edited rule can be written back to source.
@@ -212,6 +265,9 @@ impl WebPreviewView {
             current_rendered_frame: None,
             previous_rendered_frame: None,
             image_bounds: None,
+            last_page_point: None,
+            viewport_size: None,
+            _viewport_task: None,
             css_panel,
             style_sheets,
             _chrome: None,
@@ -396,9 +452,20 @@ impl WebPreviewView {
         let mut frames = cdp.subscribe("Page.screencastFrame");
         let frame_cdp = cdp.clone();
         let frame_task = cx.spawn(async move |this, cx| {
-            while let Some(params) = frames.next().await {
+            while let Some(mut params) = frames.next().await {
+                // Drain to the latest queued frame: if we've fallen behind (decode/render slower than
+                // the stream), skip stale frames and only process the freshest, so the preview never
+                // lags. Ack each skipped frame so Chrome keeps sending.
+                while let Ok(newer) = frames.try_recv() {
+                    if let Some(sid) = screencast::session_id(&params) {
+                        screencast::ack_no_reply(&frame_cdp, sid);
+                    }
+                    params = newer;
+                }
+                // Ack the frame we're about to render (fire-and-forget — the ack has no useful
+                // result, and registering a pending slot per frame is pure overhead).
                 if let Some(session_id) = screencast::session_id(&params) {
-                    screencast::ack(&frame_cdp, session_id).await.log_err();
+                    screencast::ack_no_reply(&frame_cdp, session_id);
                 }
                 let decoded = cx
                     .background_spawn(async move { screencast::decode_frame(&params) })
@@ -640,12 +707,12 @@ impl WebPreviewView {
     }
 
     /// Forward a left click in the preview image to the page over CDP.
-    /// Map a pane-local mouse position to page CSS coordinates, accounting for the letterboxed image
-    /// rect. Returns `None` if there's no live frame or the point is outside the rendered page.
+    /// Map a window-local mouse position to page CSS coordinates. `image_bounds` is the *contained*
+    /// image rect (captured in layout), so this maps directly against where the pixels are painted.
+    /// Returns `None` if there's no live frame or the point is outside the rendered page.
     fn page_coords(&self, position: gpui::Point<Pixels>) -> Option<(f32, f32)> {
         let frame = self.latest_frame.as_ref()?;
-        let pane_bounds = self.image_bounds?;
-        let image_bounds = ObjectFit::Contain.get_bounds(pane_bounds, frame.image.size(0));
+        let image_bounds = self.image_bounds?;
         if !image_bounds.contains(&position) {
             return None;
         }
@@ -658,6 +725,61 @@ impl WebPreviewView {
         )
     }
 
+    /// Push the panel's size to Chrome so the page lays out at the size the user sees (RC-2). Called
+    /// from layout when the panel's pixel size changes; debounced so a drag-resize doesn't storm CDP.
+    fn sync_viewport(
+        &mut self,
+        css_width: u32,
+        css_height: u32,
+        scale: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let css_width = css_width.max(1);
+        let css_height = css_height.max(1);
+        if self.viewport_size == Some((css_width, css_height)) {
+            return;
+        }
+        let SessionState::Connected(cdp) = &self.state else {
+            return;
+        };
+        self.viewport_size = Some((css_width, css_height));
+        let cdp = cdp.clone();
+        let executor = cx.background_executor().clone();
+        // Debounce ~150ms so a resize drag issues one override at the end, not hundreds.
+        self._viewport_task = Some(cx.background_spawn(async move {
+            executor.timer(Duration::from_millis(150)).await;
+            // Set the layout viewport...
+            cdp.send(
+                "Emulation.setDeviceMetricsOverride",
+                json!({
+                    "width": css_width,
+                    "height": css_height,
+                    "deviceScaleFactor": scale,
+                    "mobile": false,
+                }),
+            )
+            .await
+            .log_err();
+            // ...and re-key the screencast to the same device pixel size (so the streamed image
+            // matches the panel and the macOS headless viewport bug is corrected per-restart).
+            let device_w = (css_width as f32 * scale) as u32;
+            let device_h = (css_height as f32 * scale) as u32;
+            cdp.send("Page.stopScreencast", Value::Null).await.log_err();
+            cdp.send(
+                "Page.startScreencast",
+                json!({
+                    "format": "jpeg",
+                    "quality": 80,
+                    "everyNthFrame": 1,
+                    "maxWidth": device_w,
+                    "maxHeight": device_h,
+                }),
+            )
+            .await
+            .log_err();
+        }));
+    }
+
     fn forward_click(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         // In pick mode Chrome handles selection via the inspect overlay; don't interfere.
         if self.picking {
@@ -667,12 +789,21 @@ impl WebPreviewView {
             return;
         };
         let Some((page_x, page_y)) = self.page_coords(event.position) else {
+            log::debug!("web preview: click outside page area, ignored");
             return;
         };
+        self.last_page_point = Some((page_x, page_y));
 
         let cdp = cdp.clone();
         cx.background_spawn(async move {
-            for event_type in ["mousePressed", "mouseReleased"] {
+            // Prime hover at the point first (real browsers move the pointer before pressing, so
+            // :hover / mousemove-gated UI is in the right state), then press and release with the
+            // correct `buttons` bitmask.
+            cdp.send_no_reply(
+                "Input.dispatchMouseEvent",
+                json!({ "type": "mouseMoved", "x": page_x, "y": page_y, "button": "none", "buttons": 0 }),
+            );
+            for (event_type, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
                 cdp.send(
                     "Input.dispatchMouseEvent",
                     json!({
@@ -680,6 +811,7 @@ impl WebPreviewView {
                         "x": page_x,
                         "y": page_y,
                         "button": "left",
+                        "buttons": buttons,
                         "clickCount": 1,
                     }),
                 )
@@ -698,12 +830,18 @@ impl WebPreviewView {
         let SessionState::Connected(cdp) = &self.state else {
             return;
         };
-        let Some((page_x, page_y)) = self.page_coords(event.position) else {
-            return;
-        };
-        // Convert the scroll delta to pixels. Line-based deltas are scaled to a sensible pixel step.
-        let line_height = 20.0;
-        let delta = event.delta.pixel_delta(px(line_height));
+        // Scroll has no per-pixel target — the user scrolls "the page". If the cursor is over the
+        // letterbox margin, fall back to the last in-page point (or page center) instead of dropping
+        // the event, which is the dominant "feels dead" cause.
+        let (page_x, page_y) = self
+            .page_coords(event.position)
+            .or(self.last_page_point)
+            .unwrap_or((1.0, 1.0));
+
+        // GPUI scroll deltas → pixels. macOS natural-scroll sign is already correct; CDP `mouseWheel`
+        // follows the DOM wheel convention (positive deltaY scrolls content down), matching GPUI, so
+        // NO negation (verified against real headless Chrome). Both axes must always be present.
+        let delta = event.delta.pixel_delta(px(20.0));
         let (delta_x, delta_y) = (f32::from(delta.x), f32::from(delta.y));
         if delta_x == 0.0 && delta_y == 0.0 {
             return;
@@ -717,9 +855,8 @@ impl WebPreviewView {
                     "type": "mouseWheel",
                     "x": page_x,
                     "y": page_y,
-                    // CDP scrolls the page by the *negative* of the wheel delta direction.
-                    "deltaX": -delta_x,
-                    "deltaY": -delta_y,
+                    "deltaX": delta_x,
+                    "deltaY": delta_y,
                 }),
             )
             .await
@@ -728,8 +865,63 @@ impl WebPreviewView {
         .detach();
     }
 
-    /// Forward mouse movement so the page gets hover states.
-    fn forward_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+    /// Forward a key press to the page over CDP. Sends `keyDown` (+ a `char` event carrying `text`
+    /// for printable characters, which is what actually inserts the character) then `keyUp`.
+    fn forward_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        if self.picking {
+            return;
+        }
+        let SessionState::Connected(cdp) = &self.state else {
+            return;
+        };
+        let ks = &event.keystroke;
+        // CDP modifier bitmask: Alt=1, Ctrl=2, Meta/Cmd=4, Shift=8.
+        let mut modifiers = 0;
+        if ks.modifiers.alt {
+            modifiers |= 1;
+        }
+        if ks.modifiers.control {
+            modifiers |= 2;
+        }
+        if ks.modifiers.platform {
+            modifiers |= 4;
+        }
+        if ks.modifiers.shift {
+            modifiers |= 8;
+        }
+        let (key, code, vk, text) = key_to_cdp(ks);
+
+        let cdp = cdp.clone();
+        cx.background_spawn(async move {
+            let base = json!({
+                "key": key,
+                "code": code,
+                "windowsVirtualKeyCode": vk,
+                "nativeVirtualKeyCode": vk,
+                "modifiers": modifiers,
+            });
+            // keyDown — include `text` so Chrome treats printable keys as character input.
+            let mut down = base.clone();
+            if let Some(t) = &text {
+                down["type"] = json!("keyDown");
+                down["text"] = json!(t);
+                down["unmodifiedText"] = json!(t);
+            } else {
+                down["type"] = json!("rawKeyDown");
+            }
+            cdp.send("Input.dispatchKeyEvent", down).await.log_err();
+
+            let mut up = base;
+            up["type"] = json!("keyUp");
+            cdp.send("Input.dispatchKeyEvent", up).await.log_err();
+        })
+        .detach();
+    }
+
+    /// Forward mouse movement so the page gets hover states. Fire-and-forget (no pending-map slot)
+    /// so a fast drag doesn't accumulate in-flight requests, and only when the cursor actually moved
+    /// to a new page coordinate.
+    fn forward_move(&mut self, event: &MouseMoveEvent, _cx: &mut Context<Self>) {
         if self.picking {
             return;
         }
@@ -739,17 +931,21 @@ impl WebPreviewView {
         let Some((page_x, page_y)) = self.page_coords(event.position) else {
             return;
         };
+        // Skip duplicate positions (GPUI can emit repeats); only forward genuine movement.
+        if self.last_page_point == Some((page_x, page_y)) {
+            return;
+        }
+        self.last_page_point = Some((page_x, page_y));
 
-        let cdp = cdp.clone();
-        cx.background_spawn(async move {
-            cdp.send(
-                "Input.dispatchMouseEvent",
-                json!({ "type": "mouseMoved", "x": page_x, "y": page_y }),
-            )
-            .await
-            .log_err();
-        })
-        .detach();
+        let buttons = if event.pressed_button == Some(MouseButton::Left) {
+            1
+        } else {
+            0
+        };
+        cdp.send_no_reply(
+            "Input.dispatchMouseEvent",
+            json!({ "type": "mouseMoved", "x": page_x, "y": page_y, "buttons": buttons }),
+        );
     }
 }
 
@@ -1045,16 +1241,28 @@ impl Render for WebPreviewView {
 
             let view = cx.entity().downgrade();
             let picking = self.picking;
+            let image_size = image.size(0);
             div()
                     .relative()
                     .size_full()
                     .child(img(image).size_full())
                     .child(
-                        // Capture the rendered image's bounds each layout for click→page mapping.
+                        // Capture, each layout: (1) the *contained* image rect (where `img` actually
+                        // paints, accounting for letterbox) as image_bounds so click→page mapping is
+                        // lock-step with the pixels; (2) the panel CSS size + scale, to push to Chrome
+                        // as the viewport so the page lays out at the size the user sees.
                         canvas(
-                            move |bounds, _window, cx| {
-                                view.update(cx, |this, _| this.image_bounds = Some(bounds))
-                                    .ok();
+                            move |pane_bounds, window, cx| {
+                                let contained =
+                                    ObjectFit::Contain.get_bounds(pane_bounds, image_size);
+                                let css_w = f32::from(pane_bounds.size.width) as u32;
+                                let css_h = f32::from(pane_bounds.size.height) as u32;
+                                let scale = window.scale_factor();
+                                view.update(cx, |this, cx| {
+                                    this.image_bounds = Some(contained);
+                                    this.sync_viewport(css_w, css_h, scale, cx);
+                                })
+                                .ok();
                             },
                             |_bounds, _, _window, _cx| {},
                         )
@@ -1063,7 +1271,9 @@ impl Render for WebPreviewView {
                     )
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            // Focus the panel so subsequent keystrokes route here, then forward click.
+                            window.focus(&this.focus_handle, cx);
                             this.forward_click(event, cx);
                         }),
                     )
@@ -1072,6 +1282,9 @@ impl Render for WebPreviewView {
                     }))
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                         this.forward_move(event, cx);
+                    }))
+                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
+                        this.forward_key(event, cx);
                     }))
                     // In-canvas cue so the user knows pick mode is on (and normal clicks are paused).
                     .when(picking, |this| {

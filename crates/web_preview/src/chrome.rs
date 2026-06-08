@@ -109,11 +109,14 @@ pub async fn launch(
         // Headless so there is no separate Chrome window for the user to accidentally close (which
         // would kill the preview). The page renders entirely inside Zed via the CDP screencast.
         // `--headless=new` keeps full rendering + screencast + CSS/Overlay support.
+        //
+        // Do NOT add `--disable-gpu` on macOS: it forces the SwiftShader software path under
+        // `--headless=new`, which breaks `Input.mouseWheel` scrolling entirely (empirically proven)
+        // and spams GPU-process errors. `--headless=new` does not need it here.
         .arg("--headless=new")
         .arg("--hide-scrollbars")
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
-        .arg("--disable-gpu")
         .arg(url)
         .spawn()
         .with_context(|| format!("spawning chrome at {}", chrome_path.display()))?;

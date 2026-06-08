@@ -55,15 +55,13 @@ pub async fn start(cdp: &CdpClient, quality: u8, every_nth_frame: u32) -> Result
     Ok(())
 }
 
-/// Acknowledge a received frame so Chrome sends the next one. Must be called for every frame.
-pub async fn ack(cdp: &CdpClient, session_id: i64) -> Result<()> {
-    cdp.send(
+/// Acknowledge a received frame so Chrome sends the next one. Fire-and-forget: the ack has no
+/// meaningful result, so we don't register (and then have to reap) a pending-response slot per frame.
+pub fn ack_no_reply(cdp: &CdpClient, session_id: i64) {
+    cdp.send_no_reply(
         "Page.screencastFrameAck",
         json!({ "sessionId": session_id }),
-    )
-    .await
-    .context("Page.screencastFrameAck")?;
-    Ok(())
+    );
 }
 
 /// The `sessionId` carried by a `Page.screencastFrame` event (needed to ack it).
@@ -139,11 +137,12 @@ pub fn image_to_page_coords(
         1.0
     };
 
-    // `offset_top` is the captured region's top inset within the device viewport; subtract it before
-    // dividing out the scale so clicks land correctly when the page is scrolled. Clamp at 0 so an
+    // Convert device px → CSS px first (divide out the page scale factor), THEN subtract
+    // `offset_top` (which CDP reports in CSS/DIP px, not device px) and add the scroll offset. Doing
+    // the subtraction in the right unit keeps clicks correct under pinch-zoom. Clamp at 0 so an
     // out-of-viewport coordinate never dispatches as a negative page position.
     let page_x = (device_x / scale + metadata.scroll_offset_x).max(0.0);
-    let page_y = ((device_y - metadata.offset_top) / scale + metadata.scroll_offset_y).max(0.0);
+    let page_y = (device_y / scale - metadata.offset_top + metadata.scroll_offset_y).max(0.0);
     Some((page_x, page_y))
 }
 
@@ -217,5 +216,18 @@ mod tests {
         metadata.offset_top = 1000.0;
         let (_, page_y) = image_to_page_coords(&metadata, 0.0, 0.0, 500.0, 400.0).expect("maps");
         assert_eq!(page_y, 0.0);
+    }
+
+    #[test]
+    fn offset_top_subtracted_in_css_px_under_zoom() {
+        // offset_top is CSS px; device_y must be converted to CSS px BEFORE subtracting it.
+        // device viewport 1000x800, scale 2, offset_top 100 (CSS px), click at bottom-right of rect.
+        let mut metadata = metadata();
+        metadata.page_scale_factor = 2.0;
+        metadata.offset_top = 100.0;
+        // click at image (500,400) of a 500x400 rect → device (1000,800) → /2 = (500,400) CSS,
+        // then page_y = 400 - 100 = 300; page_x = 500.
+        let (x, y) = image_to_page_coords(&metadata, 500.0, 400.0, 500.0, 400.0).expect("maps");
+        assert_eq!((x, y), (500.0, 300.0));
     }
 }

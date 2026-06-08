@@ -139,6 +139,24 @@ impl CdpClient {
         self.inner.on_closed.lock().take()
     }
 
+    /// Fire-and-forget a CDP method call: serialize, send, and never register a pending-response
+    /// slot. Use for high-frequency commands whose result we don't need (`mouseMoved`,
+    /// `screencastFrameAck`) so a fast stream of them can't accumulate in-flight requests or leak
+    /// pending slots. Errors are swallowed (the connection-closed path is handled elsewhere).
+    pub fn send_no_reply(&self, method: &str, params: Value) {
+        if self.is_closed() {
+            return;
+        }
+        let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
+        let payload = json!({ "id": id, "method": method, "params": params });
+        if let Ok(text) = serde_json::to_string(&payload) {
+            let _ = self
+                .inner
+                .outgoing
+                .unbounded_send(WebSocketMessage::Text(text.into()));
+        }
+    }
+
     /// Send a CDP method call and await its result. `params` is the raw params object (use
     /// `serde_json::json!({...})`, or `Value::Null` for none).
     ///
