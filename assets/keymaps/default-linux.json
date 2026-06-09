@@ -604,6 +604,7 @@
     "bindings": {
       "alt-open": ["projects::OpenRecent", { "create_new_window": false }],
       "ctrl-k ctrl-shift-v": "web_preview::OpenWebPreview",
+      "ctrl-k ctrl-shift-i": "web_preview::ToggleWebPickMode",
       // Change the default action on `menu::Confirm` by setting the parameter
       // "alt-ctrl-o": ["projects::OpenRecent", { "create_new_window": true }],
       "alt-ctrl-o": ["projects::OpenRecent", { "create_new_window": false }],

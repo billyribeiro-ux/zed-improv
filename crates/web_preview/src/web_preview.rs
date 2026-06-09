@@ -10,14 +10,16 @@
 //! are forwarded back to the page; pick mode resolves elements to source ([`source_map`]); and the
 //! CSS panel reads/edits live styles ([`css_panel`]).
 
-mod cdp;
-mod chrome;
+// Modules are `pub` so `examples/doctor.rs` (the end-to-end diagnostic binary) can drive the real
+// pipeline; they are not a stable API.
+pub mod cdp;
+pub mod chrome;
 mod css_panel;
-mod dev_server;
-mod path_resolve;
-mod screencast;
-mod source_map;
-mod web_preview_settings;
+pub mod dev_server;
+pub mod path_resolve;
+pub mod screencast;
+pub mod source_map;
+pub mod web_preview_settings;
 
 use anyhow::{Context as _, Result};
 use cdp::CdpClient;
@@ -78,6 +80,34 @@ fn screencast_bounds(css_width: u32, css_height: u32, scale: f32) -> (u32, u32) 
         (css_width.max(1) as f32 * scale.max(1.0)).round() as u32,
         (css_height.max(1) as f32 * scale.max(1.0)).round() as u32,
     )
+}
+
+/// Pane-relative rect at which a frame of `frame_px` device pixels must be painted to be sampled
+/// 1:1 (sharp): exactly `frame_px / scale` logical pixels, centered. GPUI snaps a quad's device
+/// size from its logical size, so an integer device-pixel size survives snapping regardless of
+/// fractional origin — whereas fitting the image to the (fractional) pane can disagree with the
+/// texture by ±1 device pixel and put the whole preview into a permanent bilinear resample.
+/// Returns `None` when the frame doesn't fit the pane (mid-resize; caller falls back to a scaled
+/// fit). The 1px tolerance covers Chrome rounding capture sizes at fractional scales.
+fn pixel_exact_placement(
+    frame_px: gpui::Size<gpui::DevicePixels>,
+    pane: gpui::Size<Pixels>,
+    scale: f32,
+) -> Option<Bounds<Pixels>> {
+    let scale = scale.max(0.1);
+    let target_width = frame_px.width.0 as f32 / scale;
+    let target_height = frame_px.height.0 as f32 / scale;
+    let pane_width = f32::from(pane.width);
+    let pane_height = f32::from(pane.height);
+    (target_width <= pane_width + 1.0 && target_height <= pane_height + 1.0).then(|| {
+        Bounds::new(
+            gpui::point(
+                px((pane_width - target_width) / 2.0),
+                px((pane_height - target_height) / 2.0),
+            ),
+            gpui::size(px(target_width), px(target_height)),
+        )
+    })
 }
 
 /// Map a GPUI keystroke to the CDP `dispatchKeyEvent` fields `(key, code, windowsVirtualKeyCode,
@@ -188,6 +218,21 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
             });
             workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
         });
+
+        // Workspace-level pick-mode toggle, so the pick → edit source → pick-again loop works
+        // while focus is in an editor. The panel-context ⌘⇧I binding is shadowed there by
+        // `editor::Format` (deepest context wins), which both broke re-entry AND reformatted the
+        // user's file; this handler is reached via its own non-colliding chord.
+        workspace.register_action(move |workspace, _: &ToggleWebPickMode, window, cx| {
+            let view = workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<WebPreviewView>())
+                .or_else(|| workspace.items_of_type::<WebPreviewView>(cx).next());
+            if let Some(view) = view {
+                window.focus(&view.focus_handle(cx), cx);
+                view.update(cx, |view, cx| view.toggle_pick_mode(cx));
+            }
+        });
     })
     .detach();
 }
@@ -223,6 +268,12 @@ pub struct WebPreviewView {
     /// Bounds of the *contained* (letterboxed) preview image, captured each layout for click→page
     /// coordinate mapping. Kept lock-step with where `img` actually paints.
     image_bounds: Option<Bounds<Pixels>>,
+    /// The preview pane's full (fractional) bounds from the last layout. The frame is painted at
+    /// exactly `frame_device_px / scale` logical pixels centered in this rect, so the snapped GPU
+    /// quad equals the texture size — any ±1 device-pixel mismatch (e.g. from sizing the image to
+    /// the pane with `ObjectFit`) puts the whole preview into a permanent one-texel bilinear
+    /// resample, i.e. visible blur.
+    preview_bounds: Option<Bounds<Pixels>>,
     /// Last in-page coordinate we mapped to, used as the scroll fallback when the cursor is over the
     /// letterbox margin (so scroll never silently drops) and to de-dup `mouseMoved` forwarding.
     last_page_point: Option<(f32, f32)>,
@@ -297,6 +348,7 @@ impl WebPreviewView {
             current_rendered_frame: None,
             previous_rendered_frame: None,
             image_bounds: None,
+            preview_bounds: None,
             last_page_point: None,
             panel_px: None,
             viewport_metrics: None,
@@ -934,10 +986,14 @@ impl WebPreviewView {
         self.set_pick_mode(!self.picking, cx);
     }
 
-    /// Cancel pick mode if active (bound to Esc).
+    /// Cancel pick mode if active (bound to Esc). When not picking, the event is propagated so
+    /// Escape still reaches outer handlers AND `forward_key` can deliver it to the previewed page
+    /// (e.g. to close a modal in the user's app) — consuming it unconditionally ate every Escape.
     fn cancel_pick_mode(&mut self, cx: &mut Context<Self>) {
         if self.picking {
             self.set_pick_mode(false, cx);
+        } else {
+            cx.propagate();
         }
     }
 
@@ -1310,7 +1366,9 @@ impl WebPreviewView {
                     })
                     .child(
                         IconButton::new("looking-glass-pick", IconName::MagnifyingGlass)
-                            .tooltip(Tooltip::text("Pick an element to open its source (⌘⇧I)"))
+                            .tooltip(Tooltip::text(
+                                "Pick an element to open its source (⌘⇧I · ⌘K ⌘⇧I from the editor)",
+                            ))
                             .toggle_state(self.picking)
                             .on_click(
                                 cx.listener(|this, _, _window, cx| this.toggle_pick_mode(cx)),
@@ -1468,7 +1526,8 @@ impl WebPreviewView {
             .shadow_md()
             .child(Label::new("Shortcuts").weight(FontWeight::SEMIBOLD))
             .child(row("⌘K ⌘⇧V", "Open Looking Glass"))
-            .child(row("⌘⇧I", "Toggle pick mode"))
+            .child(row("⌘⇧I", "Toggle pick mode (panel focused)"))
+            .child(row("⌘K ⌘⇧I", "Toggle pick mode from anywhere"))
             .child(
                 div()
                     .pt_1()
@@ -1515,11 +1574,31 @@ impl Render for WebPreviewView {
             self.current_rendered_frame = Some(image.clone());
 
             let picking = self.picking;
+            // Pixel-exact paint (see `pixel_exact_placement`). Falls back to Contain-fit only when
+            // the frame doesn't fit the pane (mid-resize, before the new viewport lands) —
+            // transiently scaled, never wrongly placed.
+            let exact = self.preview_bounds.and_then(|pane| {
+                pixel_exact_placement(image.size(0), pane.size, window.scale_factor())
+            });
+            let frame_image = if let Some(placement) = exact {
+                img(image)
+                    .absolute()
+                    .left(placement.origin.x)
+                    .top(placement.origin.y)
+                    .w(placement.size.width)
+                    .h(placement.size.height)
+                    .into_any_element()
+            } else {
+                img(image)
+                    .size_full()
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element()
+            };
             div()
                     .relative()
                     .size_full()
                     .overflow_hidden()
-                    .child(img(image).size_full().object_fit(ObjectFit::Contain))
+                    .child(frame_image)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -1577,29 +1656,33 @@ impl Render for WebPreviewView {
 
         // Capture, each layout (in BOTH the live and onboarding states, so the first session can
         // launch at the real panel size and resize is detected even with no frames flowing):
-        // (1) the *contained* image rect (where `img` actually paints, accounting for letterbox) as
-        // image_bounds so click→page mapping is lock-step with the pixels; (2) the panel CSS size +
-        // scale, to push to Chrome as the viewport so the page lays out at the size the user sees.
-        // The letterbox rect is driven from the SAME pixel space the coordinate mapping uses — the
-        // frame's device dimensions reported by CDP, not the raw JPEG size — so an aspect mismatch
-        // between the clamped JPEG and the viewport can't displace off-center clicks.
-        let aspect_size = self.latest_frame.as_ref().map(|frame| {
-            gpui::Size::new(
-                gpui::DevicePixels(frame.metadata.device_width.max(1.0) as i32),
-                gpui::DevicePixels(frame.metadata.device_height.max(1.0) as i32),
-            )
-        });
+        // (1) the image rect where the frame actually paints — the SAME pixel-exact math as the
+        // `img` placement above, from the decoded frame's own dimensions — as image_bounds, so
+        // click→page mapping is lock-step with the pixels; (2) the panel's fractional bounds and
+        // CSS size + scale, to position the next paint and push the viewport to Chrome.
+        let frame_px = self
+            .latest_frame
+            .as_ref()
+            .map(|frame| frame.image.size(0));
         let measure = {
             let view = cx.entity().downgrade();
             canvas(
                 move |pane_bounds, window, cx| {
-                    let contained = aspect_size
-                        .map(|aspect| ObjectFit::Contain.get_bounds(pane_bounds, aspect));
+                    let scale = window.scale_factor();
+                    let image_bounds = frame_px.map(|frame| {
+                        match pixel_exact_placement(frame, pane_bounds.size, scale) {
+                            Some(placement) => Bounds::new(
+                                pane_bounds.origin + placement.origin,
+                                placement.size,
+                            ),
+                            None => ObjectFit::Contain.get_bounds(pane_bounds, frame),
+                        }
+                    });
                     let css_w = f32::from(pane_bounds.size.width) as u32;
                     let css_h = f32::from(pane_bounds.size.height) as u32;
-                    let scale = window.scale_factor();
                     view.update(cx, |this, cx| {
-                        this.image_bounds = contained;
+                        this.image_bounds = image_bounds;
+                        this.preview_bounds = Some(pane_bounds);
                         this.sync_viewport(css_w, css_h, scale, cx);
                     })
                     .ok();
@@ -1688,6 +1771,46 @@ mod tests {
         assert_eq!(code, "Space");
         assert_eq!(vk, 32);
         assert_eq!(text.as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn pixel_exact_placement_is_one_to_one_with_device_pixels() {
+        // 2560x1600 frame on a 2x window must paint at exactly 1280x800 logical px so the snapped
+        // quad equals the texture size (1:1 sampling, no bilinear blur).
+        let placement = pixel_exact_placement(
+            gpui::size(gpui::DevicePixels(2560), gpui::DevicePixels(1600)),
+            gpui::size(px(1280.7), px(800.3)),
+            2.0,
+        )
+        .expect("frame fits");
+        assert_eq!(f32::from(placement.size.width), 1280.0);
+        assert_eq!(f32::from(placement.size.height), 800.0);
+        // Centered within the fractional pane.
+        assert!((f32::from(placement.origin.x) - 0.35).abs() < 0.01);
+        assert!((f32::from(placement.origin.y) - 0.15).abs() < 0.01);
+    }
+
+    #[test]
+    fn pixel_exact_placement_tolerates_chrome_rounding_at_fractional_scale() {
+        // At scale 1.25 a 333-css-px pane captures round(333*1.25)=416 device px; 416/1.25=332.8
+        // logical px must still take the exact path (sharp), not fall back to a scaled fit.
+        let placement = pixel_exact_placement(
+            gpui::size(gpui::DevicePixels(416), gpui::DevicePixels(416)),
+            gpui::size(px(333.0), px(333.0)),
+            1.25,
+        );
+        assert!(placement.is_some());
+    }
+
+    #[test]
+    fn pixel_exact_placement_rejects_oversized_frames() {
+        // A stale 2x-of-large-pane frame during a shrink must fall back to scaled fit, not overflow.
+        let placement = pixel_exact_placement(
+            gpui::size(gpui::DevicePixels(2560), gpui::DevicePixels(1600)),
+            gpui::size(px(600.0), px(400.0)),
+            2.0,
+        );
+        assert!(placement.is_none());
     }
 
     #[test]

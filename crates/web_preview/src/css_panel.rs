@@ -19,7 +19,9 @@
 use crate::cdp::CdpClient;
 use anyhow::{Context as _, Result};
 use collections::HashMap;
-use editor::{Editor, EditorEvent};
+use editor::{Editor, EditorEvent, EditorMode, MultiBuffer};
+use futures::StreamExt as _;
+use futures::channel::mpsc;
 use gpui::{ClipboardItem, Entity, FocusHandle, Focusable, Task, WeakEntity, prelude::*};
 use language::{Bias, Buffer, PointUtf16, Unclipped};
 use parking_lot::Mutex;
@@ -149,10 +151,19 @@ impl WriteRoute {
 
 /// A rule shown in the panel: its target, write route, and its own editor.
 struct RuleEntry {
+    /// Live-apply target, refreshed after every `CSS.setStyleTexts` (browser-side ranges shift as
+    /// text changes).
     target: EditTarget,
+    /// The target as loaded at pick time, never refreshed. Deterministic write-back compares the
+    /// ON-DISK file against what the browser had loaded *originally*; the refreshed `target`
+    /// reflects post-live-edit browser state and would always trip the drift guard.
+    loaded_target: EditTarget,
     route: WriteRoute,
     selector: SharedString,
     editor: Entity<Editor>,
+    /// Failure of the most recent Write attempt for THIS rule, shown inline. Kept per-rule so one
+    /// failed write doesn't blank the whole panel.
+    write_error: Option<SharedString>,
     _subscription: gpui::Subscription,
 }
 
@@ -168,6 +179,11 @@ pub struct CssPanel {
     /// A transient message shown when a *settled* live edit fails to apply (read-only sheet,
     /// detached node) — distinct from the expected mid-token parse failures, which are not surfaced.
     apply_error: Option<SharedString>,
+    /// Queue feeding the long-lived apply worker. Edits are enqueued per keystroke; the worker
+    /// debounces and serializes them, so an in-flight `setStyleTexts` + range re-fetch is never
+    /// cancelled mid-flight by the next keystroke (which left ranges stale and corrupted later
+    /// edits when the apply task itself was replaced per keystroke).
+    apply_queue: Option<mpsc::UnboundedSender<(usize, String)>>,
     _load_task: Option<Task<()>>,
     _apply_task: Option<Task<()>>,
     _write_task: Option<Task<()>>,
@@ -198,6 +214,7 @@ impl CssPanel {
             rules: Vec::new(),
             status: Status::Empty,
             apply_error: None,
+            apply_queue: None,
             _load_task: None,
             _apply_task: None,
             _write_task: None,
@@ -218,6 +235,7 @@ impl CssPanel {
         self.rules.clear();
         self.apply_error = None;
         cx.notify();
+        self.spawn_apply_worker(cdp.clone(), node_id, cx);
 
         let languages = self.project.read(cx).languages().clone();
         let task = cx.spawn_in(window, async move |this, cx| {
@@ -254,8 +272,22 @@ impl CssPanel {
                 }
                 buffer
             });
-            let editor =
-                cx.new(|cx| Editor::for_buffer(buffer, Some(self.project.clone()), window, cx));
+            // Auto-height (content-sized): a full-mode editor requests `relative(1.)` height,
+            // which collapses to ZERO inside this auto-height rule list — the panel rendered
+            // selectors and buttons but no visible CSS at all.
+            let multibuffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            let editor = cx.new(|cx| {
+                Editor::new(
+                    EditorMode::AutoHeight {
+                        min_lines: 1,
+                        max_lines: Some(12),
+                    },
+                    multibuffer,
+                    Some(self.project.clone()),
+                    window,
+                    cx,
+                )
+            });
 
             let subscription =
                 cx.subscribe(&editor, move |this, editor, event: &EditorEvent, cx| {
@@ -273,10 +305,12 @@ impl CssPanel {
                 .unwrap_or_else(|| "element.style (inline)".to_string());
 
             rules.push(RuleEntry {
+                loaded_target: rule.target.clone(),
                 target: rule.target,
                 route,
                 selector: selector.into(),
                 editor,
+                write_error: None,
                 _subscription: subscription,
             });
         }
@@ -354,34 +388,53 @@ impl CssPanel {
         Ok(rules)
     }
 
-    /// Debounced live-apply of rule `index`. Each keystroke resets a short timer; only after the
-    /// text settles do we send one `CSS.setStyleTexts` and re-fetch — instead of two websocket
-    /// round-trips (and a guaranteed mid-token parse failure) on every keystroke.
-    fn apply_live(&mut self, index: usize, css_text: String, cx: &mut Context<Self>) {
-        let Some(cdp) = self.cdp.clone() else {
-            return;
-        };
-        let Some(rule) = self.rules.get(index) else {
-            return;
-        };
-        let target = rule.target.clone();
-        let node_id = self.node_id;
+    /// Enqueue a live-apply of rule `index`. The worker debounces and serializes the queue.
+    fn apply_live(&mut self, index: usize, css_text: String, _cx: &mut Context<Self>) {
+        if let Some(queue) = &self.apply_queue {
+            queue.unbounded_send((index, css_text)).ok();
+        }
+    }
+
+    /// The long-lived apply worker for the current pick. Debounces keystrokes, then sends ONE
+    /// `CSS.setStyleTexts` and re-fetches all matched ranges. Running edits through a single
+    /// serialized worker (instead of one cancellable task per keystroke) guarantees an in-flight
+    /// apply + range re-fetch is never cancelled midway — a cancelled re-fetch left `target`
+    /// ranges stale, and the next edit then replaced the wrong span in the browser stylesheet.
+    /// The rule's target is read AFTER the debounce settles, never captured at keystroke time.
+    fn spawn_apply_worker(&mut self, cdp: CdpClient, node_id: i64, cx: &mut Context<Self>) {
+        let (queue, mut pending_edits) = mpsc::unbounded::<(usize, String)>();
+        self.apply_queue = Some(queue);
         let executor = cx.background_executor().clone();
 
-        let task = cx.spawn(async move |this, cx| {
-            // Debounce: wait for typing to settle. A newer keystroke replaces this task (dropping it
-            // here, cancelling the wait) before this fires.
-            executor.timer(APPLY_DEBOUNCE).await;
+        self._apply_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(mut edit) = pending_edits.next().await {
+                // Debounce: keep absorbing newer edits until a full quiet period passes.
+                loop {
+                    executor.timer(APPLY_DEBOUNCE).await;
+                    let mut newest = None;
+                    while let Ok(newer) = pending_edits.try_recv() {
+                        newest = Some(newer);
+                    }
+                    match newest {
+                        Some(newer) => edit = newer,
+                        None => break,
+                    }
+                }
+                let (index, css_text) = edit;
+                let Ok(Some(target)) = this.read_with(cx, |this, _| {
+                    this.rules.get(index).map(|rule| rule.target.clone())
+                }) else {
+                    continue;
+                };
 
-            match cdp
-                .send("CSS.setStyleTexts", set_style_edit(&target, &css_text))
-                .await
-            {
-                Ok(_) => {
-                    // Re-fetch and refresh the ranges of *every* rule: editing one rule shifts the
-                    // offsets of later rules in the same stylesheet, so only updating `index` would
-                    // leave siblings stale. Match by stable identity, not position.
-                    if let Some(node_id) = node_id {
+                match cdp
+                    .send("CSS.setStyleTexts", set_style_edit(&target, &css_text))
+                    .await
+                {
+                    Ok(_) => {
+                        // Re-fetch and refresh the ranges of *every* rule: editing one rule shifts
+                        // the offsets of later rules in the same stylesheet, so only updating
+                        // `index` would leave siblings stale.
                         if let Ok(loaded) = Self::fetch_matched_rules(&cdp, node_id).await {
                             this.update(cx, |this, cx| {
                                 this.refresh_targets(&loaded);
@@ -390,30 +443,38 @@ impl CssPanel {
                             .ok();
                         }
                     }
-                }
-                Err(error) => {
-                    // Settled text that still fails is a real problem (read-only sheet, detached
-                    // node), not a mid-token typo — surface it.
-                    log::warn!("CSS.setStyleTexts failed: {error:#}");
-                    this.update(cx, |this, cx| {
-                        this.apply_error = Some("Couldn't apply this change to the page.".into());
-                        cx.notify();
-                    })
-                    .ok();
+                    Err(error) => {
+                        // Settled text that still fails is a real problem (read-only sheet,
+                        // detached node), not a mid-token typo — surface it.
+                        log::warn!("CSS.setStyleTexts failed: {error:#}");
+                        this.update(cx, |this, cx| {
+                            this.apply_error =
+                                Some("Couldn't apply this change to the page.".into());
+                            cx.notify();
+                        })
+                        .ok();
+                    }
                 }
             }
-        });
-        self._apply_task = Some(task);
+        }));
     }
 
-    /// Refresh every rule entry's `target` from a fresh fetch, matched by stable identity
-    /// (`styleSheetId` + selector) so positional drift can't mis-assign ranges.
+    /// Refresh every rule entry's live `target` from a fresh fetch, matched by stable identity
+    /// (`styleSheetId` + selector) so positional drift can't mis-assign ranges. Duplicate
+    /// selectors in one sheet (e.g. the same rule inside and outside an `@media` block) are paired
+    /// by occurrence order — both lists come from the same fetch ordering — so the Nth duplicate
+    /// entry gets the Nth duplicate's range, not the first one's. `loaded_target` (the write-back
+    /// snapshot) is deliberately never refreshed.
     fn refresh_targets(&mut self, loaded: &[LoadedRule]) {
+        let mut claimed = vec![false; loaded.len()];
         for entry in &mut self.rules {
-            if let Some(fresh) = loaded.iter().find(|candidate| {
-                candidate.target.style_sheet_id == entry.target.style_sheet_id
+            let fresh = loaded.iter().enumerate().find(|(index, candidate)| {
+                !claimed[*index]
+                    && candidate.target.style_sheet_id == entry.target.style_sheet_id
                     && candidate.target.selector == entry.target.selector
-            }) {
+            });
+            if let Some((index, fresh)) = fresh {
+                claimed[index] = true;
                 entry.target = fresh.target.clone();
             }
         }
@@ -443,13 +504,25 @@ impl CssPanel {
             return;
         };
         let css_text = rule.editor.read(cx).text(cx);
-        let target = rule.target.clone();
+        // Write-back uses the LOAD-TIME target: the drift guard compares the on-disk file (which
+        // live edits never touch) against what the browser had loaded at pick time. The refreshed
+        // live `target` holds post-edit browser text/ranges and would always report drift.
+        let target = rule.loaded_target.clone();
 
         match rule.route.clone() {
             WriteRoute::Source(abs_path) => {
-                self.write_deterministic(abs_path, &css_text, &target, window, cx)
+                self.write_deterministic(index, abs_path, &css_text, &target, window, cx)
             }
             WriteRoute::Agent => self.write_via_agent(&css_text, &target, window, cx),
+        }
+    }
+
+    /// Record a Write failure on the affected rule only, leaving every editor in place. (Replacing
+    /// the whole body with an error label unmounted all editors mid-edit.)
+    fn set_write_error(&mut self, index: usize, message: SharedString, cx: &mut Context<Self>) {
+        if let Some(rule) = self.rules.get_mut(index) {
+            rule.write_error = Some(message);
+            cx.notify();
         }
     }
 
@@ -464,6 +537,7 @@ impl CssPanel {
     ///    NOT edit; we surface an error and leave the file untouched.
     fn write_deterministic(
         &mut self,
+        index: usize,
         abs_path: PathBuf,
         css_text: &str,
         target: &EditTarget,
@@ -520,27 +594,34 @@ impl CssPanel {
                 Ok(WriteOutcome::Written) => {
                     this.notify("Saved to source".to_string(), cx);
                     this.clear_apply_error(cx);
+                    if let Some(rule) = this.rules.get_mut(index) {
+                        rule.write_error = None;
+                        cx.notify();
+                    }
                 }
                 Ok(WriteOutcome::Drifted) => {
-                    this.status = Status::Error(
+                    this.set_write_error(
+                        index,
                         "Source has changed since this rule was loaded — not written, to avoid \
-                             overwriting unrelated code. Re-pick the element and try again, or use \
-                             the agent."
+                         overwriting unrelated code. Re-pick the element, or use the agent."
                             .into(),
+                        cx,
                     );
-                    cx.notify();
                 }
                 Ok(WriteOutcome::RangeInvalid) => {
-                    this.status = Status::Error(
+                    this.set_write_error(
+                        index,
                         "Couldn't locate this rule's range in the source file.".into(),
+                        cx,
                     );
-                    cx.notify();
                 }
                 Err(error) => {
                     log::error!("web preview CSS write-back failed: {error:#}");
-                    this.status =
-                        Status::Error(format!("Write to source failed: {error:#}").into());
-                    cx.notify();
+                    this.set_write_error(
+                        index,
+                        format!("Write to source failed: {error:#}").into(),
+                        cx,
+                    );
                 }
             })
             .ok();
@@ -696,6 +777,7 @@ impl Render for CssPanel {
             Status::Editing => {
                 let rows = self.rules.iter().enumerate().map(|(index, rule)| {
                     let route_label = rule.route.label();
+                    let write_error = rule.write_error.clone();
                     v_flex()
                         .gap_0p5()
                         .py_1()
@@ -732,9 +814,21 @@ impl Render for CssPanel {
                                 ),
                         )
                         .child(div().px_2().child(rule.editor.clone()))
+                        .when_some(write_error, |this, message| {
+                            this.child(
+                                div().px_2().child(
+                                    Label::new(message)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Error),
+                                ),
+                            )
+                        })
                 });
                 v_flex()
                     .id("web-preview-css-rules")
+                    // `size_full` is what gives the scroll container a bounded height; without it
+                    // the element is content-sized and the scroll range is zero (list unscrollable).
+                    .size_full()
                     .overflow_y_scroll()
                     .children(rows)
                     .into_any_element()
