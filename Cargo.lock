@@ -20824,12 +20824,10 @@ dependencies = [
  "smallvec",
  "smol",
  "telemetry",
- "theme",
  "ui",
  "util",
  "which 6.0.3",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]

@@ -61,6 +61,25 @@ const PRODUCT_NAME: &str = "Looking Glass";
 /// Marker type for deduplicating Looking Glass toasts.
 struct WebPreviewNotice;
 
+fn viewport_scale_key(scale: f32) -> u32 {
+    (scale.max(1.0) * 1000.0).round() as u32
+}
+
+fn viewport_metrics(css_width: u32, css_height: u32, scale: f32) -> (u32, u32, u32) {
+    (
+        css_width.max(1),
+        css_height.max(1),
+        viewport_scale_key(scale),
+    )
+}
+
+fn screencast_bounds(css_width: u32, css_height: u32, scale: f32) -> (u32, u32) {
+    (
+        (css_width.max(1) as f32 * scale.max(1.0)).round() as u32,
+        (css_height.max(1) as f32 * scale.max(1.0)).round() as u32,
+    )
+}
+
 /// Map a GPUI keystroke to the CDP `dispatchKeyEvent` fields `(key, code, windowsVirtualKeyCode,
 /// text)`. `text` is `Some` for printable characters (which insert text) and `None` for control keys.
 fn key_to_cdp(ks: &gpui::Keystroke) -> (String, String, u32, Option<String>) {
@@ -207,7 +226,7 @@ pub struct WebPreviewView {
     panel_px: Option<(u32, u32, f32)>,
     /// The viewport size actually confirmed-pushed to Chrome. Set only AFTER the override lands, so a
     /// dropped/failed override is retried rather than skipped by the guard.
-    viewport_size: Option<(u32, u32)>,
+    viewport_metrics: Option<(u32, u32, u32)>,
     /// Debounce task for viewport re-sync on resize.
     _viewport_task: Option<Task<()>>,
     css_panel: Entity<CssPanel>,
@@ -271,7 +290,7 @@ impl WebPreviewView {
             image_bounds: None,
             last_page_point: None,
             panel_px: None,
-            viewport_size: None,
+            viewport_metrics: None,
             _viewport_task: None,
             css_panel,
             style_sheets,
@@ -305,7 +324,7 @@ impl WebPreviewView {
         // Reset the synced-viewport record so the fresh session re-pushes the viewport even if the
         // panel is the same size (otherwise the size guard suppresses the override and the page
         // renders at the wrong size after a Retry).
-        self.viewport_size = None;
+        self.viewport_metrics = None;
         self.state = SessionState::Connecting;
         cx.notify();
 
@@ -469,23 +488,23 @@ impl WebPreviewView {
             framework = framework.label()
         );
 
-        // Set the layout viewport to the panel's PHYSICAL-pixel size BEFORE starting the screencast,
-        // so the page lays out at the size the user sees (not Chrome's 800×600 default) AND the
-        // screencast captures at retina resolution (it ignores deviceScaleFactor, so we bake the
-        // scale into the CSS width with dsf=1; see sync_viewport). Use the measured panel size if
-        // layout has happened, else a sensible default.
+        // Set the layout viewport to the panel's CSS-pixel size BEFORE starting the screencast, so
+        // the page lays out at the size the user sees instead of Chrome's 800×600 default. Chrome's
+        // screencast API currently emits CSS-sized frames even at deviceScaleFactor > 1, but lying to
+        // Chrome with a physical-pixel CSS viewport breaks responsive layout and hit testing.
         let (vp_w, vp_h, vp_scale) = this
             .read_with(cx, |this, _| this.panel_px)
             .ok()
             .flatten()
             .unwrap_or((1280, 800, 2.0));
-        let capture_w = (vp_w as f32 * vp_scale).round() as u32;
-        let capture_h = (vp_h as f32 * vp_scale).round() as u32;
-        screencast::set_viewport(&cdp, capture_w, capture_h, 1.0)
+        let (capture_w, capture_h) = screencast_bounds(vp_w, vp_h, vp_scale);
+        screencast::set_viewport(&cdp, vp_w, vp_h, vp_scale)
             .await
             .context("setting viewport")?;
-        this.update(cx, |this, _| this.viewport_size = Some((vp_w, vp_h)))
-            .ok();
+        this.update(cx, |this, _| {
+            this.viewport_metrics = Some(viewport_metrics(vp_w, vp_h, vp_scale))
+        })
+        .ok();
 
         screencast::start(
             &cdp,
@@ -548,15 +567,19 @@ impl WebPreviewView {
                     })
                     .unwrap_or((None, 92u8, 1u32));
                 let (css_w, css_h, scale) = vp.unwrap_or((1280, 800, 2.0));
-                let cap_w = (css_w as f32 * scale).round() as u32;
-                let cap_h = (css_h as f32 * scale).round() as u32;
-                screencast::set_viewport(&load_cdp, cap_w, cap_h, 1.0)
+                let (cap_w, cap_h) = screencast_bounds(css_w, css_h, scale);
+                if screencast::set_viewport(&load_cdp, css_w, css_h, scale)
                     .await
-                    .log_err();
+                    .log_err()
+                    .is_none()
+                {
+                    continue;
+                }
                 screencast::restart(&load_cdp, quality, nth, cap_w, cap_h).await;
                 // Re-detect framework (a reload re-runs the app; metadata reappears after hydration).
                 let framework = source_map::detect_framework(&load_cdp).await;
                 this.update(cx, |this, cx| {
+                    this.viewport_metrics = Some(viewport_metrics(css_w, css_h, scale));
                     if framework != Framework::Unknown {
                         this.framework = framework;
                     }
@@ -637,13 +660,10 @@ impl WebPreviewView {
         page_y: f32,
         cx: &mut gpui::AsyncApp,
     ) -> Result<()> {
-        // Hit-test the element at the (page-CSS-px) click point. `DOM.getNodeForLocation` takes
-        // viewport coordinates; since our page coords already include scroll offset, subtract the
-        // scroll back out by using the position relative to the current scroll — but CDP expects
-        // viewport-relative, and our page_x/page_y are document coords. getNodeForLocation actually
-        // wants viewport px, so we pass the visible-viewport position. We approximate with page
-        // coords (correct when not scrolled); robust enough for picking.
-        let located = cdp
+        // Hit-test the element at the page coordinate derived from the current screencast metadata.
+        // In the Chrome versions we target, DOM.getNodeForLocation accounts for page scroll when
+        // given that document-space point.
+        let located = match cdp
             .send(
                 "DOM.getNodeForLocation",
                 json!({
@@ -652,7 +672,20 @@ impl WebPreviewView {
                     "includeUserAgentShadowDOM": false,
                 }),
             )
-            .await?;
+            .await
+        {
+            Ok(located) => located,
+            Err(error) => {
+                this.update(cx, |this, cx| {
+                    this.notify_user(
+                        format!("Couldn't resolve an element at that point: {error}"),
+                        cx,
+                    );
+                })
+                .ok();
+                return Ok(());
+            }
+        };
         let Some(backend_node_id) = located.get("backendNodeId").and_then(Value::as_i64) else {
             this.update(cx, |this, cx| {
                 this.notify_user(
@@ -704,6 +737,15 @@ impl WebPreviewView {
             let resolution = source_map::resolve(cdp, framework, &object_id).await?;
             this.update(cx, |this, cx| this.handle_resolution(resolution, cx))
                 .ok();
+        } else {
+            this.update(cx, |this, cx| {
+                this.notify_user(
+                    "Couldn't inspect the picked element — try clicking a rendered DOM element."
+                        .to_string(),
+                    cx,
+                );
+            })
+            .ok();
         }
 
         if let Some(node_id) = node_id {
@@ -771,7 +813,12 @@ impl WebPreviewView {
     /// Open the resolved source file at the exact line/column in the workspace.
     fn open_source(&mut self, location: SourceLocation, cx: &mut Context<Self>) {
         let Some(abs_path) = path_resolve::resolve(&self.project, &location.file, cx) else {
-            log::warn!("could not locate {} in any worktree", location.file);
+            let message = format!(
+                "Couldn't find {} in this project. If you moved the project, restart the dev server.",
+                location.file
+            );
+            log::warn!("{message}");
+            self.notify_user(message, cx);
             return;
         };
         let Some(workspace) = self.workspace.upgrade() else {
@@ -782,26 +829,45 @@ impl WebPreviewView {
             location.line.saturating_sub(1),
             location.column.saturating_sub(1),
         );
+        let reported_file = location.file;
         let window_handle = self.window_handle;
+        let workspace_for_error = workspace.clone();
 
         cx.spawn(async move |_, cx| {
-            // `open_abs_path` needs a `Window`; obtain one via the view's window handle.
-            let open_task = window_handle.update(cx, |_, window, cx| {
-                workspace.update(cx, |workspace, cx| {
-                    workspace.open_abs_path(abs_path, OpenOptions::default(), window, cx)
-                })
-            })?;
-            let item = open_task.await?;
-            window_handle.update(cx, |_, window, cx| {
-                if let Some(editor) = item.downcast::<editor::Editor>() {
-                    editor.update(cx, |editor, cx| {
-                        editor.go_to_singleton_buffer_point_silently(point, window, cx);
-                    });
-                }
-            })?;
-            anyhow::Ok(())
+            let result = async {
+                // `open_abs_path` needs a `Window`; obtain one via the view's window handle.
+                let open_task = window_handle.update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.open_abs_path(abs_path, OpenOptions::default(), window, cx)
+                    })
+                })?;
+                let item = open_task.await?;
+                window_handle.update(cx, |_, window, cx| {
+                    if let Some(editor) = item.downcast::<editor::Editor>() {
+                        editor.update(cx, |editor, cx| {
+                            editor.go_to_singleton_buffer_point_silently(point, window, cx);
+                        });
+                    }
+                })?;
+                anyhow::Ok(())
+            }
+            .await;
+
+            if let Err(error) = result {
+                let message = format!("Couldn't open {reported_file}: {error:#}");
+                log::warn!("{message}");
+                workspace_for_error.update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        workspace::Toast::new(
+                            workspace::notifications::NotificationId::unique::<WebPreviewNotice>(),
+                            message,
+                        ),
+                        cx,
+                    );
+                });
+            }
         })
-        .detach_and_log_err(cx);
+        .detach();
     }
 
     fn toggle_pick_mode(&mut self, cx: &mut Context<Self>) {
@@ -881,9 +947,10 @@ impl WebPreviewView {
         let css_height = css_height.max(1);
         self.panel_px = Some((css_width, css_height, scale));
 
-        // Skip only if we've actually CONFIRMED this size to Chrome (viewport_size is set after the
-        // override lands), and we're connected.
-        if self.viewport_size == Some((css_width, css_height)) {
+        // Skip only if we've actually CONFIRMED these metrics to Chrome (set after the override
+        // lands), and we're connected.
+        let metrics = viewport_metrics(css_width, css_height, scale);
+        if self.viewport_metrics == Some(metrics) {
             return;
         }
         let SessionState::Connected(cdp) = &self.state else {
@@ -893,18 +960,11 @@ impl WebPreviewView {
         let executor = cx.background_executor().clone();
         let quality = WebPreviewSettings::get_global(cx).screencast_quality;
         let nth = WebPreviewSettings::get_global(cx).screencast_every_nth_frame;
-        // `Page.startScreencast` captures at the CSS-pixel resolution and IGNORES deviceScaleFactor
-        // (verified against real Chrome: dsf=2 still yields a 1× frame), so on a retina panel a
-        // CSS-sized frame is upscaled and looks blurry. To capture at the panel's PHYSICAL pixels we
-        // set the CSS viewport to the device-pixel size with deviceScaleFactor=1. The page lays out a
-        // little wider but renders crisp; coordinate mapping stays correct because it keys off the
-        // frame's reported device dimensions throughout.
-        let capture_w = (css_width as f32 * scale).round() as u32;
-        let capture_h = (css_height as f32 * scale).round() as u32;
+        let (capture_w, capture_h) = screencast_bounds(css_width, css_height, scale);
         // Debounce ~150ms so a resize drag issues one override at the end, not hundreds.
         self._viewport_task = Some(cx.spawn(async move |this, cx| {
             executor.timer(Duration::from_millis(150)).await;
-            if screencast::set_viewport(&cdp, capture_w, capture_h, 1.0)
+            if screencast::set_viewport(&cdp, css_width, css_height, scale)
                 .await
                 .log_err()
                 .is_none()
@@ -913,10 +973,8 @@ impl WebPreviewView {
             }
             screencast::restart(&cdp, quality, nth, capture_w, capture_h).await;
             // Mark confirmed ONLY after the override actually landed.
-            this.update(cx, |this, _| {
-                this.viewport_size = Some((css_width, css_height))
-            })
-            .ok();
+            this.update(cx, |this, _| this.viewport_metrics = Some(metrics))
+                .ok();
         }));
     }
 
@@ -1415,7 +1473,8 @@ impl Render for WebPreviewView {
             div()
                     .relative()
                     .size_full()
-                    .child(img(image).size_full())
+                    .overflow_hidden()
+                    .child(img(image).size_full().object_fit(ObjectFit::Contain))
                     .child(
                         // Capture, each layout: (1) the *contained* image rect (where `img` actually
                         // paints, accounting for letterbox) as image_bounds so click→page mapping is
@@ -1516,9 +1575,17 @@ impl Render for WebPreviewView {
             .child(
                 h_flex()
                     .size_full()
-                    .child(div().flex_1().h_full().child(preview))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .child(preview),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
                             .w(px(320.))
                             .h_full()
                             .border_l_1()
@@ -1527,5 +1594,24 @@ impl Render for WebPreviewView {
                     ),
             )
             .child(help)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_metrics_clamp_css_dimensions_and_track_scale() {
+        assert_eq!(viewport_metrics(0, 0, 0.5), (1, 1, 1000));
+        assert_eq!(viewport_metrics(400, 300, 2.0), (400, 300, 2000));
+        assert_eq!(viewport_metrics(400, 300, 1.25), (400, 300, 1250));
+    }
+
+    #[test]
+    fn screencast_bounds_request_physical_frame_bounds_without_changing_css_viewport() {
+        assert_eq!(screencast_bounds(400, 300, 2.0), (800, 600));
+        assert_eq!(screencast_bounds(400, 300, 1.25), (500, 375));
+        assert_eq!(screencast_bounds(0, 0, 0.5), (1, 1));
     }
 }
