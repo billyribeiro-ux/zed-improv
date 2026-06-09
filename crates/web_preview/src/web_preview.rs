@@ -442,29 +442,30 @@ impl WebPreviewView {
             framework = framework.label()
         );
 
-        // Set the layout viewport to the panel's size BEFORE starting the screencast, so the page
-        // lays out at the size the user sees (not Chrome's 800×600 headless default) — this is what
-        // makes clicks land, the page reflow, and the image sharp. Use the panel's measured size if
+        // Set the layout viewport to the panel's PHYSICAL-pixel size BEFORE starting the screencast,
+        // so the page lays out at the size the user sees (not Chrome's 800×600 default) AND the
+        // screencast captures at retina resolution (it ignores deviceScaleFactor, so we bake the
+        // scale into the CSS width with dsf=1; see sync_viewport). Use the measured panel size if
         // layout has happened, else a sensible default.
         let (vp_w, vp_h, vp_scale) = this
             .read_with(cx, |this, _| this.panel_px)
             .ok()
             .flatten()
             .unwrap_or((1280, 800, 2.0));
-        screencast::set_viewport(&cdp, vp_w, vp_h, vp_scale)
+        let capture_w = (vp_w as f32 * vp_scale).round() as u32;
+        let capture_h = (vp_h as f32 * vp_scale).round() as u32;
+        screencast::set_viewport(&cdp, capture_w, capture_h, 1.0)
             .await
             .context("setting viewport")?;
         this.update(cx, |this, _| this.viewport_size = Some((vp_w, vp_h)))
             .ok();
 
-        let device_w = (vp_w as f32 * vp_scale) as u32;
-        let device_h = (vp_h as f32 * vp_scale) as u32;
         screencast::start(
             &cdp,
             settings.screencast_quality,
             settings.screencast_every_nth_frame,
-            device_w,
-            device_h,
+            capture_w,
+            capture_h,
         )
         .await
         .context("starting screencast")?;
@@ -823,19 +824,25 @@ impl WebPreviewView {
         let executor = cx.background_executor().clone();
         let quality = WebPreviewSettings::get_global(cx).screencast_quality;
         let nth = WebPreviewSettings::get_global(cx).screencast_every_nth_frame;
+        // `Page.startScreencast` captures at the CSS-pixel resolution and IGNORES deviceScaleFactor
+        // (verified against real Chrome: dsf=2 still yields a 1× frame), so on a retina panel a
+        // CSS-sized frame is upscaled and looks blurry. To capture at the panel's PHYSICAL pixels we
+        // set the CSS viewport to the device-pixel size with deviceScaleFactor=1. The page lays out a
+        // little wider but renders crisp; coordinate mapping stays correct because it keys off the
+        // frame's reported device dimensions throughout.
+        let capture_w = (css_width as f32 * scale).round() as u32;
+        let capture_h = (css_height as f32 * scale).round() as u32;
         // Debounce ~150ms so a resize drag issues one override at the end, not hundreds.
         self._viewport_task = Some(cx.spawn(async move |this, cx| {
             executor.timer(Duration::from_millis(150)).await;
-            let device_w = (css_width as f32 * scale) as u32;
-            let device_h = (css_height as f32 * scale) as u32;
-            if screencast::set_viewport(&cdp, css_width, css_height, scale)
+            if screencast::set_viewport(&cdp, capture_w, capture_h, 1.0)
                 .await
                 .log_err()
                 .is_none()
             {
                 return;
             }
-            screencast::restart(&cdp, quality, nth, device_w, device_h).await;
+            screencast::restart(&cdp, quality, nth, capture_w, capture_h).await;
             // Mark confirmed ONLY after the override actually landed.
             this.update(cx, |this, _| {
                 this.viewport_size = Some((css_width, css_height))
