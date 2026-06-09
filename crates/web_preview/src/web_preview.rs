@@ -1101,7 +1101,11 @@ impl WebPreviewView {
             self.image_bounds
         );
         let Some((page_x, page_y)) = self.page_coords(event.position) else {
-            log::info!("web preview: click mapped to None (outside page area), ignored");
+            log::info!(
+                "web preview: click mapped to None (outside page area), ignored; frame={:?}, pane={:?}",
+                self.latest_frame.as_ref().map(|frame| frame.image.size(0)),
+                self.preview_bounds,
+            );
             return;
         };
         log::info!("web preview: click -> page coords ({page_x}, {page_y})");
@@ -1690,6 +1694,13 @@ impl Render for WebPreviewView {
                 |_bounds, _, _window, _cx| {},
             )
             .absolute()
+            // Explicit insets are load-bearing: an absolutely-positioned element WITHOUT them is
+            // laid out at its *static position* (below/after its sibling), not at the parent's
+            // origin. This canvas then reported a rect hanging past the pane's bottom edge, so
+            // every click was "outside page area" and the garbage size was even pushed to Chrome
+            // as the viewport (observed live: image_bounds origin y=745 in a pane starting at
+            // y=75, with all clicks ignored).
+            .inset_0()
             .size_full()
         };
 
