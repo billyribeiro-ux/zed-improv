@@ -98,11 +98,16 @@ fn key_to_cdp(ks: &gpui::Keystroke) -> (String, String, u32, Option<String>) {
         "end" => Some(("End", "End", 35)),
         "pageup" => Some(("PageUp", "PageUp", 33)),
         "pagedown" => Some(("PageDown", "PageDown", 34)),
-        "space" => Some((" ", "Space", 32)),
         _ => None,
     };
     if let Some((key, code, vk)) = named {
         return (key.to_string(), code.to_string(), vk, None);
+    }
+    // Space is printable: it must carry `text` or Chrome inserts nothing (a `rawKeyDown` without
+    // text types no character — verified). GPUI reports it as the named key "space", so the
+    // generic key_char path below would miss it.
+    if ks.key == "space" {
+        return (" ".into(), "Space".into(), 32, Some(" ".into()));
     }
 
     // Printable: use the character the OS produced (respects shift/layout). Derive a plausible
@@ -227,6 +232,10 @@ pub struct WebPreviewView {
     /// The viewport size actually confirmed-pushed to Chrome. Set only AFTER the override lands, so a
     /// dropped/failed override is retried rather than skipped by the guard.
     viewport_metrics: Option<(u32, u32, u32)>,
+    /// The window's scale factor at view creation, passed to Chrome as
+    /// `--force-device-scale-factor` so the screencast captures at physical (retina) resolution.
+    /// Launch-time only: Chrome's window scale can't be changed at runtime.
+    launch_scale: f32,
     /// Debounce task for viewport re-sync on resize.
     _viewport_task: Option<Task<()>>,
     css_panel: Entity<CssPanel>,
@@ -291,6 +300,7 @@ impl WebPreviewView {
             last_page_point: None,
             panel_px: None,
             viewport_metrics: None,
+            launch_scale: window.scale_factor(),
             _viewport_task: None,
             css_panel,
             style_sheets,
@@ -396,11 +406,15 @@ impl WebPreviewView {
         } else {
             settings.remote_debugging_port
         };
+        let launch_scale = this
+            .read_with(cx, |this, _| this.launch_scale)
+            .unwrap_or(1.0);
         let process = chrome::launch(
             chrome_path,
             &settings.url,
             port,
             user_data_dir,
+            launch_scale,
             http_client,
             executor,
         )
@@ -489,14 +503,15 @@ impl WebPreviewView {
         );
 
         // Set the layout viewport to the panel's CSS-pixel size BEFORE starting the screencast, so
-        // the page lays out at the size the user sees instead of Chrome's 800×600 default. Chrome's
-        // screencast API currently emits CSS-sized frames even at deviceScaleFactor > 1, but lying to
+        // the page lays out at the size the user sees instead of Chrome's 800×600 default. The
+        // physical-resolution (sharp) frames come from `--force-device-scale-factor` at launch —
+        // overriding deviceScaleFactor here alone still yields CSS-sized frames, and lying to
         // Chrome with a physical-pixel CSS viewport breaks responsive layout and hit testing.
         let (vp_w, vp_h, vp_scale) = this
             .read_with(cx, |this, _| this.panel_px)
             .ok()
             .flatten()
-            .unwrap_or((1280, 800, 2.0));
+            .unwrap_or((1280, 800, launch_scale));
         let (capture_w, capture_h) = screencast_bounds(vp_w, vp_h, vp_scale);
         screencast::set_viewport(&cdp, vp_w, vp_h, vp_scale)
             .await
@@ -506,26 +521,35 @@ impl WebPreviewView {
         })
         .ok();
 
-        screencast::start(
-            &cdp,
-            settings.screencast_quality,
-            settings.screencast_every_nth_frame,
-            capture_w,
-            capture_h,
-        )
-        .await
-        .context("starting screencast")?;
+        // Subscribe to frames and loads BEFORE starting the screencast. A static (already settled)
+        // page emits exactly ONE frame — at screencast start — and subscribing afterwards loses the
+        // race against the read pump, leaving the preview on "Waiting for the first frame…" forever
+        // with every click ignored (verified against Chrome 149).
+        let frames = cdp.subscribe("Page.screencastFrame");
+        let loads = cdp.subscribe("Page.loadEventFired");
+
+        screencast::start(&cdp, settings.screencast_quality, capture_w, capture_h)
+            .await
+            .context("starting screencast")?;
         this.update(cx, |this, cx| {
-            this.spawn_event_loops(cdp.clone(), cx);
+            this.spawn_event_loops(cdp.clone(), frames, loads, cx);
         })
         .ok();
 
         Ok(cdp)
     }
 
-    /// Subscribe to the CDP events we care about and route them back onto the view. Runs in the
-    /// view's own context so the spawned tasks can update `self`.
-    fn spawn_event_loops(&mut self, cdp: CdpClient, cx: &mut Context<Self>) {
+    /// Route the CDP events we care about back onto the view. The frame and load streams are
+    /// subscribed by the caller BEFORE the screencast starts (see `establish_session`) so the
+    /// single first frame of a static page can't be dropped. Runs in the view's own context so the
+    /// spawned tasks can update `self`.
+    fn spawn_event_loops(
+        &mut self,
+        cdp: CdpClient,
+        frames: futures::channel::mpsc::UnboundedReceiver<Value>,
+        loads: futures::channel::mpsc::UnboundedReceiver<Value>,
+        cx: &mut Context<Self>,
+    ) {
         // (Stylesheet headers are subscribed earlier, before `CSS.enable`, in `establish_session`.)
 
         // Disconnect watcher: when the CDP socket closes (Chrome exits, dev server restarts, network
@@ -550,22 +574,18 @@ impl WebPreviewView {
         // clears the viewport override (verified against real Chrome — frames stop flowing until
         // re-issued). Re-apply viewport + screencast and re-detect the framework on every load so the
         // preview keeps working after the user refreshes, instead of freezing on a dead frame.
-        let mut loads = cdp.subscribe("Page.loadEventFired");
+        let mut loads = loads;
         let load_cdp = cdp.clone();
         let load_task = cx.spawn(async move |this, cx| {
             while loads.next().await.is_some() {
                 log::info!("web preview: page loaded — re-initializing session");
                 // Re-issue viewport at the panel's captured size and restart the screencast.
-                let (vp, quality, nth) = this
+                let (vp, quality) = this
                     .read_with(cx, |this, cx| {
                         let settings = WebPreviewSettings::get_global(cx);
-                        (
-                            this.panel_px,
-                            settings.screencast_quality,
-                            settings.screencast_every_nth_frame,
-                        )
+                        (this.panel_px, settings.screencast_quality)
                     })
-                    .unwrap_or((None, 92u8, 1u32));
+                    .unwrap_or((None, 80u8));
                 let (css_w, css_h, scale) = vp.unwrap_or((1280, 800, 2.0));
                 let (cap_w, cap_h) = screencast_bounds(css_w, css_h, scale);
                 if screencast::set_viewport(&load_cdp, css_w, css_h, scale)
@@ -575,7 +595,7 @@ impl WebPreviewView {
                 {
                     continue;
                 }
-                screencast::restart(&load_cdp, quality, nth, cap_w, cap_h).await;
+                screencast::restart(&load_cdp, quality, cap_w, cap_h).await;
                 // Re-detect framework (a reload re-runs the app; metadata reappears after hydration).
                 let framework = source_map::detect_framework(&load_cdp).await;
                 this.update(cx, |this, cx| {
@@ -592,9 +612,20 @@ impl WebPreviewView {
 
         // Screencast frames: decode on a background thread, apply on the foreground. This is the last
         // consumer of `cdp`, so move it in.
-        let mut frames = cdp.subscribe("Page.screencastFrame");
+        let mut frames = frames;
         let frame_cdp = cdp;
+        // Client-side frame pacing: Chrome streams unthrottled (50+ fps on an animating page), and
+        // each frame costs a full JPEG decode plus a multi-MiB GPU texture upload — the dominant
+        // CPU/GPU load of the whole feature. Cap the decode/upload rate (~30 fps, divided further by
+        // the every-Nth setting) and let the drain loop below skip to the freshest frame; Chrome's
+        // ack budget then paces the stream itself. The FIRST frame is never delayed, so static
+        // pages still paint immediately.
+        let every_nth = WebPreviewSettings::get_global(cx)
+            .screencast_every_nth_frame
+            .max(1);
+        let frame_interval = Duration::from_millis(33) * every_nth;
         let frame_task = cx.spawn(async move |this, cx| {
+            let mut first_frame_rendered = false;
             while let Some(mut params) = frames.next().await {
                 // Drain to the latest queued frame: if we've fallen behind (decode/render slower than
                 // the stream), skip stale frames and only process the freshest, so the preview never
@@ -623,6 +654,10 @@ impl WebPreviewView {
                         if dropped.is_err() {
                             break;
                         }
+                        if first_frame_rendered {
+                            cx.background_executor().timer(frame_interval).await;
+                        }
+                        first_frame_rendered = true;
                     }
                     Err(error) => log::warn!("screencast frame decode failed: {error:#}"),
                 }
@@ -696,7 +731,32 @@ impl WebPreviewView {
             .ok();
             return Ok(());
         };
-        let node_id = located.get("nodeId").and_then(Value::as_i64);
+        // `DOM.getNodeForLocation` only returns a frontend `nodeId` once a document has been
+        // requested in this session — without `DOM.getDocument` it returns just the backend id and
+        // the CSS panel (which needs a `nodeId`) never loads (verified against Chrome 149). Request
+        // the document (depth 0 — we don't need the tree), then push the backend id to get a real
+        // `nodeId`.
+        let node_id = match cdp.send("DOM.getDocument", json!({ "depth": 0 })).await {
+            Ok(_) => cdp
+                .send(
+                    "DOM.pushNodesByBackendIdsToFrontend",
+                    json!({ "backendNodeIds": [backend_node_id] }),
+                )
+                .await
+                .log_err()
+                .and_then(|pushed| {
+                    pushed
+                        .get("nodeIds")
+                        .and_then(Value::as_array)
+                        .and_then(|ids| ids.first())
+                        .and_then(Value::as_i64)
+                })
+                .filter(|id| *id != 0),
+            Err(error) => {
+                log::warn!("web preview: DOM.getDocument failed; styles panel skipped: {error:#}");
+                None
+            }
+        };
 
         // Highlight it briefly so the user sees what was picked.
         cdp.send(
@@ -959,7 +1019,6 @@ impl WebPreviewView {
         let cdp = cdp.clone();
         let executor = cx.background_executor().clone();
         let quality = WebPreviewSettings::get_global(cx).screencast_quality;
-        let nth = WebPreviewSettings::get_global(cx).screencast_every_nth_frame;
         let (capture_w, capture_h) = screencast_bounds(css_width, css_height, scale);
         // Debounce ~150ms so a resize drag issues one override at the end, not hundreds.
         self._viewport_task = Some(cx.spawn(async move |this, cx| {
@@ -971,7 +1030,7 @@ impl WebPreviewView {
             {
                 return;
             }
-            screencast::restart(&cdp, quality, nth, capture_w, capture_h).await;
+            screencast::restart(&cdp, quality, capture_w, capture_h).await;
             // Mark confirmed ONLY after the override actually landed.
             this.update(cx, |this, _| this.viewport_metrics = Some(metrics))
                 .ok();
@@ -1455,49 +1514,12 @@ impl Render for WebPreviewView {
             }
             self.current_rendered_frame = Some(image.clone());
 
-            let view = cx.entity().downgrade();
             let picking = self.picking;
-            // Drive the letterbox rect from the SAME pixel space the coordinate mapping uses — the
-            // frame's device dimensions reported by CDP, not the raw JPEG size — so an aspect mismatch
-            // between the clamped JPEG and the viewport can't displace off-center clicks.
-            let aspect_size = self
-                .latest_frame
-                .as_ref()
-                .map(|frame| {
-                    gpui::Size::new(
-                        gpui::DevicePixels(frame.metadata.device_width.max(1.0) as i32),
-                        gpui::DevicePixels(frame.metadata.device_height.max(1.0) as i32),
-                    )
-                })
-                .unwrap_or_else(|| image.size(0));
             div()
                     .relative()
                     .size_full()
                     .overflow_hidden()
                     .child(img(image).size_full().object_fit(ObjectFit::Contain))
-                    .child(
-                        // Capture, each layout: (1) the *contained* image rect (where `img` actually
-                        // paints, accounting for letterbox) as image_bounds so click→page mapping is
-                        // lock-step with the pixels; (2) the panel CSS size + scale, to push to Chrome
-                        // as the viewport so the page lays out at the size the user sees.
-                        canvas(
-                            move |pane_bounds, window, cx| {
-                                let contained =
-                                    ObjectFit::Contain.get_bounds(pane_bounds, aspect_size);
-                                let css_w = f32::from(pane_bounds.size.width) as u32;
-                                let css_h = f32::from(pane_bounds.size.height) as u32;
-                                let scale = window.scale_factor();
-                                view.update(cx, |this, cx| {
-                                    this.image_bounds = Some(contained);
-                                    this.sync_viewport(css_w, css_h, scale, cx);
-                                })
-                                .ok();
-                            },
-                            |_bounds, _, _window, _cx| {},
-                        )
-                        .absolute()
-                        .size_full(),
-                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -1553,6 +1575,41 @@ impl Render for WebPreviewView {
             .then(|| self.render_help(cx))
             .unwrap_or_else(|| gpui::Empty.into_any_element());
 
+        // Capture, each layout (in BOTH the live and onboarding states, so the first session can
+        // launch at the real panel size and resize is detected even with no frames flowing):
+        // (1) the *contained* image rect (where `img` actually paints, accounting for letterbox) as
+        // image_bounds so click→page mapping is lock-step with the pixels; (2) the panel CSS size +
+        // scale, to push to Chrome as the viewport so the page lays out at the size the user sees.
+        // The letterbox rect is driven from the SAME pixel space the coordinate mapping uses — the
+        // frame's device dimensions reported by CDP, not the raw JPEG size — so an aspect mismatch
+        // between the clamped JPEG and the viewport can't displace off-center clicks.
+        let aspect_size = self.latest_frame.as_ref().map(|frame| {
+            gpui::Size::new(
+                gpui::DevicePixels(frame.metadata.device_width.max(1.0) as i32),
+                gpui::DevicePixels(frame.metadata.device_height.max(1.0) as i32),
+            )
+        });
+        let measure = {
+            let view = cx.entity().downgrade();
+            canvas(
+                move |pane_bounds, window, cx| {
+                    let contained = aspect_size
+                        .map(|aspect| ObjectFit::Contain.get_bounds(pane_bounds, aspect));
+                    let css_w = f32::from(pane_bounds.size.width) as u32;
+                    let css_h = f32::from(pane_bounds.size.height) as u32;
+                    let scale = window.scale_factor();
+                    view.update(cx, |this, cx| {
+                        this.image_bounds = contained;
+                        this.sync_viewport(css_w, css_h, scale, cx);
+                    })
+                    .ok();
+                },
+                |_bounds, _, _window, _cx| {},
+            )
+            .absolute()
+            .size_full()
+        };
+
         v_flex()
             .key_context("WebPreview")
             .size_full()
@@ -1577,11 +1634,13 @@ impl Render for WebPreviewView {
                     .size_full()
                     .child(
                         div()
+                            .relative()
                             .flex_1()
                             .min_w_0()
                             .h_full()
                             .overflow_hidden()
-                            .child(preview),
+                            .child(preview)
+                            .child(measure),
                     )
                     .child(
                         div()
@@ -1613,5 +1672,34 @@ mod tests {
         assert_eq!(screencast_bounds(400, 300, 2.0), (800, 600));
         assert_eq!(screencast_bounds(400, 300, 1.25), (500, 375));
         assert_eq!(screencast_bounds(0, 0, 0.5), (1, 1));
+    }
+
+    #[test]
+    fn space_key_carries_text_so_chrome_inserts_a_space() {
+        // A `rawKeyDown` without `text` inserts nothing in Chrome; space must go down the
+        // printable-key path with text " ".
+        let keystroke = gpui::Keystroke {
+            modifiers: gpui::Modifiers::default(),
+            key: "space".to_string(),
+            key_char: None,
+        };
+        let (key, code, vk, text) = key_to_cdp(&keystroke);
+        assert_eq!(key, " ");
+        assert_eq!(code, "Space");
+        assert_eq!(vk, 32);
+        assert_eq!(text.as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn named_control_keys_have_no_text() {
+        let keystroke = gpui::Keystroke {
+            modifiers: gpui::Modifiers::default(),
+            key: "enter".to_string(),
+            key_char: None,
+        };
+        let (key, _, vk, text) = key_to_cdp(&keystroke);
+        assert_eq!(key, "Enter");
+        assert_eq!(vk, 13);
+        assert_eq!(text, None);
     }
 }

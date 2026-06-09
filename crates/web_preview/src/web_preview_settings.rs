@@ -30,7 +30,9 @@ pub struct WebPreviewSettings {
     pub dev_server_timeout_secs: u64,
     /// Screencast JPEG quality (1–100).
     pub screencast_quality: u8,
-    /// Stream only every Nth browser frame.
+    /// Render only every Nth streamed frame (client-side throttle on top of the built-in ~30 fps
+    /// cap). Never passed to Chrome's `everyNthFrame`, which would drop the single frame a static
+    /// page emits and blank the preview.
     pub screencast_every_nth_frame: u32,
 }
 
@@ -63,7 +65,7 @@ impl Settings for WebPreviewSettings {
                 .unwrap_or(DEFAULT_DEV_SERVER_TIMEOUT_SECS),
             screencast_quality: web_preview
                 .and_then(|settings| settings.screencast_quality)
-                .unwrap_or(92)
+                .unwrap_or(80)
                 .clamp(1, 100) as u8,
             screencast_every_nth_frame: web_preview
                 .and_then(|settings| settings.screencast_every_nth_frame)

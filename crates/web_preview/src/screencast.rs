@@ -65,20 +65,19 @@ pub async fn set_viewport(
 
 /// Begin streaming frames sized to the device-pixel dimensions of the viewport (so the streamed
 /// image is sharp on the panel, not an upscaled 800×600). The caller subscribes to
-/// `Page.screencastFrame`, decodes via [`decode_frame`], and acks via [`ack_no_reply`].
-pub async fn start(
-    cdp: &CdpClient,
-    quality: u8,
-    every_nth_frame: u32,
-    max_width: u32,
-    max_height: u32,
-) -> Result<()> {
+/// `Page.screencastFrame` BEFORE calling this (a static page emits exactly one frame, at screencast
+/// start; subscribing after drops it and the preview stays blank forever), decodes via
+/// [`decode_frame`], and acks via [`ack_no_reply`].
+pub async fn start(cdp: &CdpClient, quality: u8, max_width: u32, max_height: u32) -> Result<()> {
     cdp.send(
         "Page.startScreencast",
         json!({
             "format": "jpeg",
             "quality": quality,
-            "everyNthFrame": every_nth_frame,
+            // Always 1: with everyNthFrame > 1 Chrome skips the *only* frame a static page ever
+            // produces and the preview is permanently blank (verified against Chrome 149). Frame
+            // throttling is done client-side in the frame loop instead.
+            "everyNthFrame": 1,
             "maxWidth": max_width.max(1),
             "maxHeight": max_height.max(1),
         }),
@@ -94,16 +93,8 @@ pub async fn start(
 /// screencast in place, and a stop-then-start has a window where, if this task is cancelled between
 /// the two awaits (e.g. a rapid resize replaces it), the stream is left STOPPED with nothing to
 /// restart it. A single idempotent start has no such gap.
-pub async fn restart(
-    cdp: &CdpClient,
-    quality: u8,
-    every_nth_frame: u32,
-    max_width: u32,
-    max_height: u32,
-) {
-    start(cdp, quality, every_nth_frame, max_width, max_height)
-        .await
-        .log_err();
+pub async fn restart(cdp: &CdpClient, quality: u8, max_width: u32, max_height: u32) {
+    start(cdp, quality, max_width, max_height).await.log_err();
 }
 
 /// Acknowledge a received frame so Chrome sends the next one. Fire-and-forget: the ack has no

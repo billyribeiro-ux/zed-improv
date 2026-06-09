@@ -102,6 +102,7 @@ pub async fn launch(
     url: &str,
     port: u16,
     user_data_dir: PathBuf,
+    device_scale: f32,
     http_client: Arc<dyn HttpClient>,
     executor: gpui::BackgroundExecutor,
 ) -> Result<ChromeProcess> {
@@ -116,6 +117,13 @@ pub async fn launch(
         // `--headless=new`, which breaks `Input.mouseWheel` scrolling entirely (empirically proven)
         // and spams GPU-process errors. `--headless=new` does not need it here.
         .arg("--headless=new")
+        // The screencast captures at the headless window's *physical* surface size, which defaults
+        // to 1x regardless of `Emulation.setDeviceMetricsOverride`'s deviceScaleFactor — overriding
+        // dsf alone still yields CSS-sized (blurry-on-retina) frames, and `maxWidth`/`maxHeight`
+        // only ever downscale (verified against Chrome 149). Forcing the window scale here is the
+        // only way to get physical-resolution frames while CSS layout and input coordinates stay
+        // at the panel's CSS size.
+        .arg(format!("--force-device-scale-factor={}", device_scale.max(1.0)))
         .arg("--hide-scrollbars")
         .arg("--no-first-run")
         .arg("--no-default-browser-check")

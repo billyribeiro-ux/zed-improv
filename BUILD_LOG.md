@@ -134,3 +134,42 @@ instead. Deterministic write-back is reserved for plain external `.css`/`.scss` 
 **Verification:** compiles clean; `clippy -D warnings` clean; `cargo fmt --check` clean; 7/7 tests
 pass; all three keymaps parse and carry both bindings. Full-app build/live run still gated by the
 missing Metal toolchain.
+
+## 2026-06-09 — `web_preview` forensic audit: dead clicks, blurry/heavy preview (evidence-driven fixes)
+
+Audited end-to-end against real Chrome 149 (June 2026 stable) and a real Vite 8 + Svelte 5.56 dev
+server, with a Node harness replaying the Rust client's CDP message sequence byte-for-byte.
+19/19 end-to-end interaction checks pass after the fixes.
+
+**Root causes found (all reproduced, then re-verified fixed):**
+1. **First-frame race → dead preview & ignored clicks.** `Page.screencastFrame` was subscribed in
+   `spawn_event_loops`, *after* `Page.startScreencast` returned. A static (settled) page emits
+   exactly ONE frame — at screencast start — so it raced the foreground hop and was dropped:
+   `latest_frame` stayed `None`, the panel sat on "Waiting for the first frame…" forever, and
+   `page_coords` returned `None` for every click ("click to open not working at all"). Animated
+   pages self-healed, masking the bug. Fix: subscribe before starting the screencast.
+2. **Blurry preview.** Chrome's screencast emits CSS/DIP-sized frames; `maxWidth`/`maxHeight` only
+   downscale, and `Emulation.setDeviceMetricsOverride`'s `deviceScaleFactor` does NOT raise capture
+   resolution (verified: requested 2560×1600, got 1280×800). On retina that's a 2× upscale. Fix:
+   launch Chrome with `--force-device-scale-factor=<window scale>` — frames then arrive at physical
+   resolution while layout and input coordinates stay in CSS px (verified: 2560×1600 frames,
+   `deviceWidth` metadata still 1280, clicks still land). The `setDeviceMetricsOverride.scale`
+   field is a trap: it doesn't change frame size AND breaks input hit-testing (verified).
+3. **Heavy.** The stream ran unthrottled (52 fps measured on an animating page), each frame a full
+   JPEG decode + multi-MiB GPU texture upload. Fix: client-side decode pacing (~30 fps cap, first
+   frame never delayed), JPEG quality default 92 → 80.
+4. **`everyNthFrame > 1` foot-gun.** Chrome counts skipped frames even when only one is ever
+   produced: nth=2 on a static page delivers ZERO frames (verified). The setting is now applied as
+   a client-side decode divisor and Chrome always gets `everyNthFrame: 1`.
+5. **CSS panel never loaded on pick.** `DOM.getNodeForLocation` returns a frontend `nodeId` only
+   after `DOM.getDocument` has been requested in the session; without it only `backendNodeId`
+   comes back, so `load_for_node` was always skipped. Fix: `DOM.getDocument {depth:0}` +
+   `DOM.pushNodesByBackendIdsToFrontend` per pick (verified: 6 matched rules load).
+6. **Space key typed nothing.** It went down the named-key path as `rawKeyDown` with no `text`
+   (verified: inserts nothing). Fix: space is printable — send `keyDown` with `text: " "`.
+7. **Svelte column off-by-one.** Svelte 5's `__svelte_meta.loc.column` is 0-based
+   (`assign_location` in svelte/internal/client/dev/elements.js); the resolver now converts to the
+   module's 1-based contract.
+
+Also: the viewport-measuring canvas now exists in the onboarding state too, so the first session
+launches at the real panel size instead of the 1280×800 fallback.
