@@ -500,6 +500,46 @@ impl WebPreviewView {
             self._tasks.push(disconnect_task);
         }
 
+        // Reload survival: a page reload (F5 / HMR full reload / navigation) STOPS the screencast and
+        // clears the viewport override (verified against real Chrome — frames stop flowing until
+        // re-issued). Re-apply viewport + screencast and re-detect the framework on every load so the
+        // preview keeps working after the user refreshes, instead of freezing on a dead frame.
+        let mut loads = cdp.subscribe("Page.loadEventFired");
+        let load_cdp = cdp.clone();
+        let load_task = cx.spawn(async move |this, cx| {
+            while loads.next().await.is_some() {
+                log::info!("web preview: page loaded — re-initializing session");
+                // Re-issue viewport at the panel's captured size and restart the screencast.
+                let (vp, quality, nth) = this
+                    .read_with(cx, |this, cx| {
+                        let settings = WebPreviewSettings::get_global(cx);
+                        (
+                            this.panel_px,
+                            settings.screencast_quality,
+                            settings.screencast_every_nth_frame,
+                        )
+                    })
+                    .unwrap_or((None, 92u8, 1u32));
+                let (css_w, css_h, scale) = vp.unwrap_or((1280, 800, 2.0));
+                let cap_w = (css_w as f32 * scale).round() as u32;
+                let cap_h = (css_h as f32 * scale).round() as u32;
+                screencast::set_viewport(&load_cdp, cap_w, cap_h, 1.0)
+                    .await
+                    .log_err();
+                screencast::restart(&load_cdp, quality, nth, cap_w, cap_h).await;
+                // Re-detect framework (a reload re-runs the app; metadata reappears after hydration).
+                let framework = source_map::detect_framework(&load_cdp).await;
+                this.update(cx, |this, cx| {
+                    if framework != Framework::Unknown {
+                        this.framework = framework;
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        });
+        self._tasks.push(load_task);
+
         // Screencast frames: decode on a background thread, apply on the foreground. This is the last
         // consumer of `cdp`, so move it in.
         let mut frames = cdp.subscribe("Page.screencastFrame");
@@ -547,7 +587,9 @@ impl WebPreviewView {
 
     /// In pick mode, resolve the element at a page coordinate and open its source.
     fn pick_at(&mut self, page_x: f32, page_y: f32, cx: &mut Context<Self>) {
+        log::info!("web preview: pick_at document coords ({page_x}, {page_y})");
         let SessionState::Connected(cdp) = &self.state else {
+            log::info!("web preview: pick ignored — not connected");
             return;
         };
         let cdp = cdp.clone();
@@ -852,10 +894,17 @@ impl WebPreviewView {
     }
 
     fn forward_click(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        log::info!(
+            "web preview: forward_click fired at window {:?}, picking={}, image_bounds={:?}",
+            event.position,
+            self.picking,
+            self.image_bounds
+        );
         let Some((page_x, page_y)) = self.page_coords(event.position) else {
-            log::debug!("web preview: click outside page area, ignored");
+            log::info!("web preview: click mapped to None (outside page area), ignored");
             return;
         };
+        log::info!("web preview: click -> page coords ({page_x}, {page_y})");
         self.last_page_point = Some((page_x, page_y));
 
         // In pick mode, resolve the element under the click directly (DOM.getNodeForLocation works
@@ -904,10 +953,12 @@ impl WebPreviewView {
 
     /// Forward a scroll wheel event to the page so the user can scroll the preview.
     fn forward_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        log::info!("web preview: forward_scroll fired, delta={:?}", event.delta);
         if self.picking {
             return;
         }
         let SessionState::Connected(cdp) = &self.state else {
+            log::info!("web preview: scroll ignored — not connected");
             return;
         };
         // Scroll has no per-pixel target — the user scrolls "the page". If the cursor is over the
