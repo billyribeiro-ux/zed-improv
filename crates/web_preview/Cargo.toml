@@ -11,6 +11,11 @@ workspace = true
 [lib]
 path = "src/web_preview.rs"
 
+[dev-dependencies]
+env_logger.workspace = true
+gpui_platform.workspace = true
+reqwest_client.workspace = true
+
 [dependencies]
 agent_ui.workspace = true
 anyhow.workspace = true

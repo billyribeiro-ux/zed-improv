@@ -173,3 +173,44 @@ server, with a Node harness replaying the Rust client's CDP message sequence byt
 
 Also: the viewport-measuring canvas now exists in the onboarding state too, so the first session
 launches at the real panel size instead of the 1280×800 fallback.
+
+## 2026-06-09 (round 2) — `web_preview`: view-layer forensics, CSS panel overhaul, pick-mode keymap, doctor binary
+
+Round 1 fixed the CDP/protocol layer; the panel still failed in real use. A second forensic pass
+(GPUI internals audit + keymap dispatch analysis + first-ever-run audit of the CSS panel path
+unlocked by the nodeId fix) found and fixed five more user-facing breakages:
+
+1. **Blur even with retina frames.** GPUI paints a frame 1:1-sharp only when the snapped quad's
+   device size EXACTLY equals the texture; sizing the image to the (fractional) flex pane via
+   `ObjectFit` disagrees by ±1 device px and leaves the whole preview in a permanent one-texel
+   bilinear resample. Fixed with `pixel_exact_placement`: the frame paints at exactly
+   `frame_device_px / scale` logical px, centered; click mapping uses the same rect (unit-tested,
+   incl. fractional panes and 1.25 scale).
+2. **CSS panel rendered no editors.** Full-mode editors request `relative(1.)` height, which
+   collapses to zero in the auto-height rule list — the panel showed selectors and Write buttons
+   but no CSS. Rule editors are now `EditorMode::AutoHeight` (content-sized, max 12 lines), and
+   the rule list scrolls (`size_full` on the scroll container — it was content-sized, scroll range 0).
+3. **⌘⇧I after a successful pick reformatted the user's file.** Pick opens the source file, focus
+   moves to that editor, and `editor::Format` (also ⌘⇧I, deeper context) shadows the panel binding.
+   Added a workspace-level `ToggleWebPickMode` handler + non-colliding `⌘K ⌘⇧I` /
+   `ctrl-k ctrl-shift-i` binding that focuses the preview and toggles pick from anywhere.
+4. **Write-to-source always failed after a live edit.** The post-apply range refresh overwrote
+   `original_css`, so the drift guard compared disk against post-edit browser text — guaranteed
+   "Drifted". Write-back now uses an immutable load-time snapshot; live applies refresh only the
+   live target. Write errors are now per-rule inline labels (a failure used to replace the whole
+   panel body, unmounting every editor). Live applies run through a serialized worker queue (an
+   in-flight apply + range re-fetch can no longer be cancelled mid-flight by the next keystroke,
+   which left stale ranges that corrupted later edits); duplicate selectors pair by occurrence.
+5. **Escape was swallowed.** `menu::Cancel` was consumed even when not picking; it now propagates
+   so the previewed app can receive Escape.
+
+**Hard evidence — `examples/doctor.rs`:** a headless binary (`gpui_platform::headless()`, the
+`eval_cli` pattern) that drives the REAL crate modules (`chrome::launch`, `cdp::CdpClient` over
+gpui_tokio, `screencast`, `source_map`) against a live dev server and prints stage-by-stage
+PASS/FAIL plus frame artifacts. Against real Chrome 149 + Vite 8 + Svelte 5.56: **18/18**,
+including first-frame-on-static-page, settled 2560×1600 retina frame (saved JPEG verified
+visually), pick resolving `src/App.svelte:7:3`, CSS rules loading, and reload survival. Run it on
+any machine: `WEB_PREVIEW_URL=http://localhost:5173 cargo run -p web_preview --example doctor`.
+Also observed and documented: the first frame after a viewport override can be a transient
+partial crop (e.g. 2560×701) while the surface resizes; settled frames are full-size, and the
+panel renders the latest frame.
