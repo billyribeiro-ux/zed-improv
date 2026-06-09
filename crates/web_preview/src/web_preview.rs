@@ -413,10 +413,27 @@ impl WebPreviewView {
                 .with_context(|| format!("enabling {domain}"))?;
         }
 
-        // Honor an explicit framework override; otherwise auto-detect.
+        // Honor an explicit framework override; otherwise auto-detect. The probe can run before the
+        // app has hydrated (no `__svelte_meta`/fibers on nodes yet), so retry a few times with a
+        // short delay rather than caching a premature "unknown" (which left the header stuck on
+        // "unknown framework" and disabled source resolution).
         let framework = match settings.framework_override {
             Some(framework) => framework,
-            None => source_map::detect_framework(&cdp).await,
+            None => {
+                let mut detected = Framework::Unknown;
+                for attempt in 0..10 {
+                    detected = source_map::detect_framework(&cdp).await;
+                    if detected != Framework::Unknown {
+                        break;
+                    }
+                    if attempt < 9 {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(300))
+                            .await;
+                    }
+                }
+                detected
+            }
         };
         this.update(cx, |this, _| this.framework = framework).ok();
         telemetry::event!(

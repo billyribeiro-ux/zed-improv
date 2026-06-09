@@ -63,7 +63,7 @@ impl Settings for WebPreviewSettings {
                 .unwrap_or(DEFAULT_DEV_SERVER_TIMEOUT_SECS),
             screencast_quality: web_preview
                 .and_then(|settings| settings.screencast_quality)
-                .unwrap_or(80)
+                .unwrap_or(92)
                 .clamp(1, 100) as u8,
             screencast_every_nth_frame: web_preview
                 .and_then(|settings| settings.screencast_every_nth_frame)
