@@ -163,14 +163,16 @@ fn missing_metadata_hint(framework: Framework) -> String {
     }
 }
 
-/// Reads Svelte's native `__svelte_meta.loc`, walking ancestors until one carries it.
+/// Reads Svelte's native `__svelte_meta.loc`, walking ancestors until one carries it. Svelte's
+/// `loc.column` is 0-based (`assign_location` in svelte/internal/client/dev/elements.js stores the
+/// raw compiler offset), so it's converted to this module's 1-based column contract here.
 const SVELTE_RESOLVER: &str = r#"
     function() {
         let node = this;
         while (node) {
             const meta = node.__svelte_meta;
             if (meta && meta.loc) {
-                return { file: meta.loc.file, line: meta.loc.line, column: meta.loc.column };
+                return { file: meta.loc.file, line: meta.loc.line, column: meta.loc.column + 1 };
             }
             node = node.parentElement;
         }

@@ -510,7 +510,8 @@ pub struct WebPreviewSettingsContent {
     ///
     /// Default: 80
     pub screencast_quality: Option<u32>,
-    /// Stream only every Nth browser frame. Higher values reduce CPU/bandwidth at lower smoothness.
+    /// Render only every Nth streamed frame (client-side throttle on top of the built-in ~30 fps
+    /// cap). Higher values reduce CPU at lower smoothness.
     ///
     /// Default: 1
     pub screencast_every_nth_frame: Option<u32>,
