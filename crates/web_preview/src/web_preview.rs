@@ -302,6 +302,10 @@ impl WebPreviewView {
         self._chrome = None;
         self.latest_frame = None;
         self.framework = Framework::Unknown;
+        // Reset the synced-viewport record so the fresh session re-pushes the viewport even if the
+        // panel is the same size (otherwise the size guard suppresses the override and the page
+        // renders at the wrong size after a Retry).
+        self.viewport_size = None;
         self.state = SessionState::Connecting;
         cx.notify();
 
@@ -391,6 +395,29 @@ impl WebPreviewView {
             .await
             .context("connecting CDP")?;
         telemetry::event!("Looking Glass Session Stage", stage = "cdp_connected");
+
+        // We're attached at the BROWSER endpoint (survives page reloads). Auto-attach to page targets
+        // so page-scoped commands/events route via the page session — and so a reload, which
+        // recreates the page target, simply re-attaches instead of killing the whole session.
+        cdp.send(
+            "Target.setAutoAttach",
+            json!({ "autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true }),
+        )
+        .await
+        .context("Target.setAutoAttach")?;
+        // Wait for the page session to be captured (from Target.attachedToTarget) before issuing any
+        // page-scoped command, or those commands would go unstamped and fail.
+        for _ in 0..50 {
+            if cdp.page_session().is_some() {
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+        }
+        if cdp.page_session().is_none() {
+            anyhow::bail!("no page target attached over CDP");
+        }
 
         // Keep the Chrome process alive for the lifetime of the view.
         this.update(cx, |this, _| this._chrome = Some(process)).ok();
@@ -1426,9 +1453,7 @@ impl Render for WebPreviewView {
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                         this.forward_move(event, cx);
                     }))
-                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
-                        this.forward_key(event, cx);
-                    }))
+                    // (Key handling lives on the focus-tracked root element — see render's v_flex.)
                     // In-canvas cue so the user knows pick mode is on (and normal clicks are paused).
                     .when(picking, |this| {
                         this.child(
@@ -1474,6 +1499,14 @@ impl Render for WebPreviewView {
             .size_full()
             .track_focus(&self.focus_handle)
             .bg(colors.editor_background)
+            // Key events route along the FOCUS path, and only this element tracks focus — so the
+            // key handler must live here (not on the inner preview div, which never gets focus) for
+            // typing into the previewed page to work.
+            .on_key_down(
+                cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
+                    this.forward_key(event, cx);
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &ToggleWebPickMode, _window, cx| this.toggle_pick_mode(cx)),
             )

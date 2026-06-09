@@ -34,12 +34,39 @@ pub struct CdpClient {
     inner: Arc<CdpInner>,
 }
 
+/// The page-target session id captured from `Target.attachedToTarget`. Shared so `send`/`dispatch`
+/// can stamp and route page-scoped traffic, and so it can be updated when Chrome re-attaches the
+/// page target after a reload — which is what lets the session survive a page refresh.
+type PageSession = Arc<Mutex<Option<String>>>;
+
+/// Page-scoped CDP domains: commands for these must carry the page `sessionId` when we're attached at
+/// the browser endpoint (flatten mode). `Target` itself is browser-scoped and must NOT be stamped.
+const PAGE_DOMAINS: &[&str] = &[
+    "Page",
+    "DOM",
+    "CSS",
+    "Overlay",
+    "Runtime",
+    "Input",
+    "Emulation",
+];
+
+fn is_page_scoped(method: &str) -> bool {
+    method
+        .split_once('.')
+        .map(|(domain, _)| PAGE_DOMAINS.contains(&domain))
+        .unwrap_or(false)
+}
+
 struct CdpInner {
     next_id: AtomicU64,
     pending: PendingMap,
     subscribers: EventSubscribers,
     outgoing: mpsc::UnboundedSender<WebSocketMessage>,
     executor: BackgroundExecutor,
+    /// The current page-target session id (browser-endpoint flatten mode). `None` when attached
+    /// directly to a page endpoint (legacy) or before the first attach.
+    page_session: PageSession,
     /// Set once the read pump terminates (socket closed / errored). After this, `send` fails fast
     /// and subscriber streams have been closed so their `.next()` yields `None`.
     closed: Arc<AtomicBool>,
@@ -73,6 +100,7 @@ impl CdpClient {
         let subscribers: EventSubscribers = Arc::new(Mutex::new(HashMap::default()));
         let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<WebSocketMessage>();
         let closed = Arc::new(AtomicBool::new(false));
+        let page_session: PageSession = Arc::new(Mutex::new(None));
         let (closed_tx, closed_rx) = oneshot::channel();
 
         let write_task = executor.spawn(async move {
@@ -88,11 +116,12 @@ impl CdpClient {
             let pending = pending.clone();
             let subscribers = subscribers.clone();
             let closed = closed.clone();
+            let page_session = page_session.clone();
             async move {
                 while let Some(message) = read.next().await {
                     match message {
                         Ok(WebSocketMessage::Text(text)) => {
-                            dispatch(&text, &pending, &subscribers);
+                            dispatch(&text, &pending, &subscribers, &page_session);
                         }
                         Ok(WebSocketMessage::Close(_)) => break,
                         Ok(_) => {}
@@ -121,6 +150,7 @@ impl CdpClient {
                 subscribers,
                 outgoing: outgoing_tx,
                 executor,
+                page_session,
                 closed,
                 on_closed: Mutex::new(Some(closed_rx)),
                 _pump: Arc::new([read_task, write_task]),
@@ -148,13 +178,31 @@ impl CdpClient {
             return;
         }
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let payload = json!({ "id": id, "method": method, "params": params });
+        let payload = self.build_payload(id, method, params);
         if let Ok(text) = serde_json::to_string(&payload) {
             let _ = self
                 .inner
                 .outgoing
                 .unbounded_send(WebSocketMessage::Text(text.into()));
         }
+    }
+
+    /// Build an outgoing CDP message, stamping the page `sessionId` when one is set and the method is
+    /// page-scoped (flatten mode at the browser endpoint). Browser-scoped methods (`Target.*`) and the
+    /// legacy page-endpoint case (no session) are sent unstamped.
+    fn build_payload(&self, id: u64, method: &str, params: Value) -> Value {
+        let mut payload = json!({ "id": id, "method": method, "params": params });
+        if is_page_scoped(method) {
+            if let Some(session_id) = self.inner.page_session.lock().clone() {
+                payload["sessionId"] = Value::String(session_id);
+            }
+        }
+        payload
+    }
+
+    /// The current page session id, if attached via the browser endpoint.
+    pub fn page_session(&self) -> Option<String> {
+        self.inner.page_session.lock().clone()
     }
 
     /// Send a CDP method call and await its result. `params` is the raw params object (use
@@ -170,7 +218,7 @@ impl CdpClient {
         let (tx, rx) = oneshot::channel();
         self.inner.pending.lock().insert(id, tx);
 
-        let payload = json!({ "id": id, "method": method, "params": params });
+        let payload = self.build_payload(id, method, params);
         let text = serde_json::to_string(&payload).context("serializing CDP request")?;
         self.inner
             .outgoing
@@ -204,7 +252,12 @@ impl CdpClient {
     }
 }
 
-fn dispatch(text: &str, pending: &PendingMap, subscribers: &EventSubscribers) {
+fn dispatch(
+    text: &str,
+    pending: &PendingMap,
+    subscribers: &EventSubscribers,
+    page_session: &PageSession,
+) {
     let Ok(message) = serde_json::from_str::<Value>(text) else {
         log::warn!("ignoring non-JSON CDP message");
         return;
@@ -221,6 +274,24 @@ fn dispatch(text: &str, pending: &PendingMap, subscribers: &EventSubscribers) {
 
     if let Some(method) = message.get("method").and_then(Value::as_str) {
         let params = message.get("params").cloned().unwrap_or(Value::Null);
+
+        // Capture the page-target session id so subsequent page-scoped commands can be stamped, and
+        // update it whenever Chrome re-attaches the page target (e.g. after a reload). This is what
+        // lets the session survive a page refresh.
+        if method == "Target.attachedToTarget" {
+            let is_page = params
+                .get("targetInfo")
+                .and_then(|info| info.get("type"))
+                .and_then(Value::as_str)
+                == Some("page");
+            if is_page {
+                if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
+                    *page_session.lock() = Some(session_id.to_string());
+                    log::info!("web preview: attached to page target (session captured)");
+                }
+            }
+        }
+
         let mut subscribers = subscribers.lock();
         if let Some(senders) = subscribers.get_mut(method) {
             // Drop any closed subscriber channels as we go.

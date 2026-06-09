@@ -88,7 +88,12 @@ pub async fn start(
     Ok(())
 }
 
-/// Restart the screencast with new size bounds (after a viewport change). Best-effort.
+/// (Re)start the screencast with new size bounds (after a viewport change). Best-effort.
+///
+/// We deliberately do NOT `Page.stopScreencast` first: `Page.startScreencast` re-keys an existing
+/// screencast in place, and a stop-then-start has a window where, if this task is cancelled between
+/// the two awaits (e.g. a rapid resize replaces it), the stream is left STOPPED with nothing to
+/// restart it. A single idempotent start has no such gap.
 pub async fn restart(
     cdp: &CdpClient,
     quality: u8,
@@ -96,7 +101,6 @@ pub async fn restart(
     max_width: u32,
     max_height: u32,
 ) {
-    cdp.send("Page.stopScreencast", Value::Null).await.log_err();
     start(cdp, quality, every_nth_frame, max_width, max_height)
         .await
         .log_err();

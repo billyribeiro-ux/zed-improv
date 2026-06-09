@@ -17,7 +17,9 @@ use std::time::Duration;
 /// A handle to a launched Chrome process. Dropping it kills the child so we don't leak browsers.
 pub struct ChromeProcess {
     child: smol::process::Child,
-    /// The page target's `webSocketDebuggerUrl`, used by [`crate::cdp::CdpClient::connect`].
+    /// The **browser** endpoint `webSocketDebuggerUrl` (`ws://…/devtools/browser/<id>`). We connect
+    /// here — not to a page target — so the CDP socket survives page reloads/navigation (which
+    /// destroy and recreate page targets). Page traffic is routed via `Target.setAutoAttach`.
     pub ws_url: String,
 }
 
@@ -121,12 +123,35 @@ pub async fn launch(
         .spawn()
         .with_context(|| format!("spawning chrome at {}", chrome_path.display()))?;
 
-    // Poll /json/list until Chrome's debugging endpoint is up and a "page" target exists.
-    let ws_url = discover_page_ws_url(port, &http_client, &executor)
+    // Wait until a "page" target exists (the page is loading), then connect to the BROWSER endpoint
+    // so the socket survives page reloads. `Target.setAutoAttach` (in establish_session) gives us the
+    // page session over that browser socket.
+    discover_page_ws_url(port, &http_client, &executor)
         .await
-        .context("discovering CDP page target")?;
+        .context("waiting for CDP page target")?;
+    let ws_url = discover_browser_ws_url(port, &http_client)
+        .await
+        .context("discovering CDP browser endpoint")?;
 
     Ok(ChromeProcess { child, ws_url })
+}
+
+/// Fetch the browser-level `webSocketDebuggerUrl` from `/json/version`. Unlike a page target, this
+/// endpoint is stable across page reloads/navigation.
+async fn discover_browser_ws_url(port: u16, http_client: &Arc<dyn HttpClient>) -> Result<String> {
+    let endpoint = format!("http://127.0.0.1:{port}/json/version");
+    let mut response = http_client
+        .get(&endpoint, AsyncBody::empty(), false)
+        .await?;
+    let mut body = Vec::new();
+    response.body_mut().read_to_end(&mut body).await?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).context("parsing /json/version response")?;
+    value
+        .get("webSocketDebuggerUrl")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .context("no browser webSocketDebuggerUrl in /json/version")
 }
 
 #[derive(Debug, Deserialize)]
