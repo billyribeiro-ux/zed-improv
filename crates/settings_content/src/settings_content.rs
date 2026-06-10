@@ -508,7 +508,7 @@ pub struct WebPreviewSettingsContent {
     pub dev_server_timeout_secs: Option<u64>,
     /// Screencast JPEG quality, 1–100. Lower trades fidelity for performance.
     ///
-    /// Default: 80
+    /// Default: 90
     pub screencast_quality: Option<u32>,
     /// Render only every Nth streamed frame (client-side throttle on top of the built-in ~30 fps
     /// cap). Higher values reduce CPU at lower smoothness.

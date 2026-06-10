@@ -940,6 +940,12 @@ wasmtime-environ = { opt-level = 3 }
 wasmtime-internal-cranelift = { opt-level = 3 }
 minidumper = { opt-level = 3 }
 serde_json = { opt-level = 3 }
+# Web-preview screencast: every frame is a multi-megapixel JPEG decode plus a per-pixel BGRA swap;
+# at opt-level 0 a single retina frame takes hundreds of ms and the preview crawls at a few fps.
+image = { opt-level = 3 }
+zune-jpeg = { opt-level = 3 }
+zune-core = { opt-level = 3 }
+web_preview = { opt-level = 2 }
 # Build single-source-file crates with cg=1 as it helps make `cargo build` of a whole workspace a bit faster
 activity_indicator = { codegen-units = 1 }
 assets = { codegen-units = 1 }

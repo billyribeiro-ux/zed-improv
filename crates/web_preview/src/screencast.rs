@@ -262,6 +262,44 @@ mod tests {
         assert_eq!(page_y, 0.0);
     }
 
+    /// Perf probe, not a correctness test: times the real decode path at the retina frame size a
+    /// large pane streams (observed live), to validate the dev-profile opt-level overrides for
+    /// image/zune-jpeg/web_preview in the workspace Cargo.toml. Run explicitly:
+    /// `cargo test -p web_preview decode_speed_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn decode_speed_probe() {
+        use base64::Engine as _;
+        let (width, height) = (3350u32, 1934u32);
+        let mut bitmap = image::RgbImage::new(width, height);
+        // Non-uniform content so the JPEG doesn't compress to a trivially decodable flat field.
+        for (x, y, pixel) in bitmap.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x ^ y) % 256) as u8]);
+        }
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+            .encode_image(&bitmap)
+            .expect("encoding probe jpeg");
+        let params = json!({
+            "data": base64::engine::general_purpose::STANDARD.encode(&jpeg),
+            "metadata": {
+                "offsetTop": 0.0,
+                "pageScaleFactor": 1.0,
+                "deviceWidth": 1675.0,
+                "deviceHeight": 967.0,
+                "scrollOffsetX": 0.0,
+                "scrollOffsetY": 0.0,
+            },
+        });
+        let iterations = 10u32;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            decode_frame(&params).expect("decoding probe frame");
+        }
+        let average = start.elapsed() / iterations;
+        println!("decode_frame avg over {iterations} iterations at {width}x{height}: {average:?}");
+    }
+
     #[test]
     fn offset_top_subtracted_in_css_px_under_zoom() {
         // offset_top is CSS px; device_y must be converted to CSS px BEFORE subtracting it.

@@ -708,7 +708,7 @@ impl WebPreviewView {
             .max(1);
         let frame_interval = Duration::from_millis(33) * every_nth;
         let frame_task = cx.spawn(async move |this, cx| {
-            let mut first_frame_rendered = false;
+            let mut last_render: Option<std::time::Instant> = None;
             while let Some(mut params) = frames.next().await {
                 // Drain to the latest queued frame: if we've fallen behind (decode/render slower than
                 // the stream), skip stale frames and only process the freshest, so the preview never
@@ -729,6 +729,19 @@ impl WebPreviewView {
                     .await;
                 match decoded {
                     Ok(frame) => {
+                        // Pace against the wall clock: only sleep the REMAINDER of the frame
+                        // budget not already spent decoding, so the period is
+                        // max(decode, interval), not decode + interval — sleeping the full
+                        // interval after a slow decode halved the effective frame rate. The
+                        // first frame is never delayed, so static pages paint immediately.
+                        if let Some(last) = last_render {
+                            let elapsed = last.elapsed();
+                            if elapsed < frame_interval {
+                                cx.background_executor()
+                                    .timer(frame_interval - elapsed)
+                                    .await;
+                            }
+                        }
                         let dropped = this.update(cx, |this, cx| {
                             let previous = this.latest_frame.replace(frame);
                             cx.notify();
@@ -737,10 +750,7 @@ impl WebPreviewView {
                         if dropped.is_err() {
                             break;
                         }
-                        if first_frame_rendered {
-                            cx.background_executor().timer(frame_interval).await;
-                        }
-                        first_frame_rendered = true;
+                        last_render = Some(std::time::Instant::now());
                     }
                     Err(error) => log::warn!("screencast frame decode failed: {error:#}"),
                 }
