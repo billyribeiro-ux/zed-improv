@@ -23,7 +23,7 @@ pub mod web_preview_settings;
 
 use anyhow::{Context as _, Result};
 use cdp::CdpClient;
-use css_panel::CssPanel;
+use css_panel::{CssPanel, CssPanelEvent};
 use futures::StreamExt as _;
 use gpui::{
     AnyElement, AnyWindowHandle, App, AppContext as _, Bounds, Entity, EventEmitter, FocusHandle,
@@ -335,6 +335,20 @@ impl WebPreviewView {
                 cx,
             )
         });
+        // Escape in the CSS panel (or one of its rule editors) returns to picking: focus the
+        // preview and re-arm pick mode so the user can choose another element. Detached: the view
+        // owns the panel, so both ends live exactly as long as the view.
+        cx.subscribe_in(
+            &css_panel,
+            window,
+            |this, _, event: &CssPanelEvent, window, cx| match event {
+                CssPanelEvent::PickAnother => {
+                    window.focus(&this.focus_handle, cx);
+                    this.set_pick_mode(true, cx);
+                }
+            },
+        )
+        .detach();
         // Release any GPU frame textures still retained when the view is dropped.
         cx.on_release(|this, cx| {
             for frame in [
@@ -1003,12 +1017,16 @@ impl WebPreviewView {
         self.set_pick_mode(!self.picking, cx);
     }
 
-    /// Cancel pick mode if active (bound to Esc). When not picking, the event is propagated so
-    /// Escape still reaches outer handlers AND `forward_key` can deliver it to the previewed page
-    /// (e.g. to close a modal in the user's app) — consuming it unconditionally ate every Escape.
+    /// Escape on the preview (bound via the global `menu::Cancel`): cancel pick mode if active;
+    /// otherwise, when an element's styles are already loaded, re-arm pick mode so the user can
+    /// choose another element. Only when neither applies is the event propagated, so Escape still
+    /// reaches outer handlers AND `forward_key` can deliver it to the previewed page (e.g. to
+    /// close a modal in the user's app) — consuming it unconditionally ate every Escape.
     fn cancel_pick_mode(&mut self, cx: &mut Context<Self>) {
         if self.picking {
             self.set_pick_mode(false, cx);
+        } else if self.css_panel.read(cx).has_node() {
+            self.set_pick_mode(true, cx);
         } else {
             cx.propagate();
         }
@@ -1549,6 +1567,7 @@ impl WebPreviewView {
             .child(row("⌘K ⌘⇧V", "Open Looking Glass"))
             .child(row("⌘⇧I", "Toggle pick mode (panel focused)"))
             .child(row("⌘K ⌘⇧I", "Toggle pick mode from anywhere"))
+            .child(row("esc", "Pick another element"))
             .child(
                 div()
                     .pt_1()
@@ -1556,8 +1575,9 @@ impl WebPreviewView {
                     .border_color(colors.border_variant)
                     .child(
                         Label::new(
-                            "Pick an element to jump to its source. Edit CSS on the right to see \
-                             changes live; Write saves to the source file.",
+                            "Pick an element to jump to its source. Edit CSS on the right — \
+                             changes show live in the preview. Apply saves them to source (or \
+                             hands off to the agent); Ignore restores the page.",
                         )
                         .size(LabelSize::Small)
                         .color(Color::Muted),
