@@ -304,6 +304,10 @@ pub struct WebPreviewView {
     /// `--force-device-scale-factor` so the screencast captures at physical (retina) resolution.
     /// Launch-time only: Chrome's window scale can't be changed at runtime.
     launch_scale: f32,
+    /// Whether the last paint used the pixel-exact (1:1, sharp) path. Tracked only to log the
+    /// TRANSITIONS between sharp and scaled-fit (soft) painting, so a persistently blurry preview
+    /// is diagnosable from the log.
+    exact_paint_engaged: Option<bool>,
     /// Debounce task for viewport re-sync on resize.
     _viewport_task: Option<Task<()>>,
     css_panel: Entity<CssPanel>,
@@ -384,6 +388,7 @@ impl WebPreviewView {
             panel_px: None,
             viewport_metrics: None,
             launch_scale: window.scale_factor(),
+            exact_paint_engaged: None,
             _viewport_task: None,
             css_panel,
             style_sheets,
@@ -709,6 +714,12 @@ impl WebPreviewView {
         let frame_interval = Duration::from_millis(33) * every_nth;
         let frame_task = cx.spawn(async move |this, cx| {
             let mut last_render: Option<std::time::Instant> = None;
+            // Rolling stream-health stats, reported every ~5s so "the preview feels slow/blurry"
+            // is diagnosable from the log instead of guesswork.
+            let mut report_started = std::time::Instant::now();
+            let mut frames_rendered = 0u32;
+            let mut frames_skipped = 0u32;
+            let mut decode_total = Duration::ZERO;
             while let Some(mut params) = frames.next().await {
                 // Drain to the latest queued frame: if we've fallen behind (decode/render slower than
                 // the stream), skip stale frames and only process the freshest, so the preview never
@@ -717,6 +728,7 @@ impl WebPreviewView {
                     if let Some(sid) = screencast::session_id(&params) {
                         screencast::ack_no_reply(&frame_cdp, sid);
                     }
+                    frames_skipped += 1;
                     params = newer;
                 }
                 // Ack the frame we're about to render (fire-and-forget — the ack has no useful
@@ -724,9 +736,11 @@ impl WebPreviewView {
                 if let Some(session_id) = screencast::session_id(&params) {
                     screencast::ack_no_reply(&frame_cdp, session_id);
                 }
+                let decode_started = std::time::Instant::now();
                 let decoded = cx
                     .background_spawn(async move { screencast::decode_frame(&params) })
                     .await;
+                decode_total += decode_started.elapsed();
                 match decoded {
                     Ok(frame) => {
                         // Pace against the wall clock: only sleep the REMAINDER of the frame
@@ -751,6 +765,20 @@ impl WebPreviewView {
                             break;
                         }
                         last_render = Some(std::time::Instant::now());
+                        frames_rendered += 1;
+                        let report_elapsed = report_started.elapsed();
+                        if report_elapsed >= Duration::from_secs(5) && frames_rendered > 0 {
+                            log::info!(
+                                "web preview: stream health — {:.1} fps rendered, {} skipped, avg decode {:.1}ms",
+                                frames_rendered as f32 / report_elapsed.as_secs_f32(),
+                                frames_skipped,
+                                decode_total.as_secs_f32() * 1000.0 / frames_rendered as f32,
+                            );
+                            report_started = std::time::Instant::now();
+                            frames_rendered = 0;
+                            frames_skipped = 0;
+                            decode_total = Duration::ZERO;
+                        }
                     }
                     Err(error) => log::warn!("screencast frame decode failed: {error:#}"),
                 }
@@ -919,6 +947,14 @@ impl WebPreviewView {
             }
         }
 
+        // The pick highlight is a transient cue: without an explicit hide it stays painted over
+        // the page indefinitely (Overlay.highlightNode persists until hideHighlight), leaving a
+        // stuck blue box + tooltip on every picked element.
+        cx.background_executor()
+            .timer(Duration::from_millis(1200))
+            .await;
+        cdp.send_no_reply("Overlay.hideHighlight", Value::Null);
+
         Ok(())
     }
 
@@ -966,8 +1002,16 @@ impl WebPreviewView {
     /// Open the resolved source file at the exact line/column in the workspace.
     fn open_source(&mut self, location: SourceLocation, cx: &mut Context<Self>) {
         let Some(abs_path) = path_resolve::resolve(&self.project, &location.file, cx) else {
+            let roots = self
+                .project
+                .read(cx)
+                .worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
             let message = format!(
-                "Couldn't find {} in this project. If you moved the project, restart the dev server.",
+                "Couldn't find {} in this project (searched: {roots}). Open the app's folder in \
+                 this window, or restart the dev server if the project moved.",
                 location.file
             );
             log::warn!("{message}");
@@ -1200,12 +1244,10 @@ impl WebPreviewView {
         .detach();
     }
 
-    /// Forward a scroll wheel event to the page so the user can scroll the preview.
-    fn forward_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
-        log::info!("web preview: forward_scroll fired, delta={:?}", event.delta);
-        if self.picking {
-            return;
-        }
+    /// Forward a scroll wheel event to the page so the user can scroll the preview. Also forwards
+    /// in pick mode — scrolling is how the user reaches the next element to pick; only clicks are
+    /// repurposed while picking.
+    fn forward_scroll(&mut self, event: &ScrollWheelEvent, _cx: &mut Context<Self>) {
         let SessionState::Connected(cdp) = &self.state else {
             log::info!("web preview: scroll ignored — not connected");
             return;
@@ -1221,28 +1263,27 @@ impl WebPreviewView {
         // GPUI scroll deltas → pixels. macOS natural-scroll sign is already correct; CDP `mouseWheel`
         // follows the DOM wheel convention (positive deltaY scrolls content down), matching GPUI, so
         // NO negation (verified against real headless Chrome). Both axes must always be present.
-        let delta = event.delta.pixel_delta(px(20.0));
+        // 40px per line matches Blink's own wheel tick, so a wheel notch travels the same distance
+        // it would in a real browser (20px needed twice the events for the same distance).
+        let delta = event.delta.pixel_delta(px(40.0));
         let (delta_x, delta_y) = (f32::from(delta.x), f32::from(delta.y));
         if delta_x == 0.0 && delta_y == 0.0 {
             return;
         }
 
-        let cdp = cdp.clone();
-        cx.background_spawn(async move {
-            cdp.send(
-                "Input.dispatchMouseEvent",
-                json!({
-                    "type": "mouseWheel",
-                    "x": page_x,
-                    "y": page_y,
-                    "deltaX": delta_x,
-                    "deltaY": delta_y,
-                }),
-            )
-            .await
-            .log_err();
-        })
-        .detach();
+        // Fire-and-forget like `mouseMoved`: wheel events stream at input rate, their result is
+        // unused, and per-event pending-reply slots piled up when the renderer stalled (observed
+        // live: 13 wheel requests stuck in flight for 16s, then erroring as a batch on disconnect).
+        cdp.send_no_reply(
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseWheel",
+                "x": page_x,
+                "y": page_y,
+                "deltaX": delta_x,
+                "deltaY": delta_y,
+            }),
+        );
     }
 
     /// Forward a key press to the page over CDP. Sends `keyDown` (+ a `char` event carrying `text`
@@ -1631,6 +1672,21 @@ impl Render for WebPreviewView {
             let exact = self.preview_bounds.and_then(|pane| {
                 pixel_exact_placement(image.size(0), pane.size, window.scale_factor())
             });
+            if self.exact_paint_engaged != Some(exact.is_some()) {
+                self.exact_paint_engaged = Some(exact.is_some());
+                let frame_px = image.size(0);
+                if exact.is_some() {
+                    log::info!("web preview: pixel-exact paint engaged (1:1, sharp)");
+                } else {
+                    log::info!(
+                        "web preview: scaled-fit paint (SOFT) — frame {}x{} device px vs pane {:?} at scale {}; persistent soft paint means the viewport override hasn't landed",
+                        frame_px.width.0,
+                        frame_px.height.0,
+                        self.preview_bounds.map(|bounds| bounds.size),
+                        window.scale_factor(),
+                    );
+                }
+            }
             let frame_image = if let Some(placement) = exact {
                 img(image)
                     .absolute()

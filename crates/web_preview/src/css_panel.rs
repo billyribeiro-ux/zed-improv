@@ -34,9 +34,11 @@ use workspace::Toast;
 use workspace::Workspace;
 use workspace::notifications::NotificationId;
 
-/// How long to wait for typing to settle before applying a live CSS edit. Coalesces a burst of
-/// keystrokes into a single `CSS.setStyleTexts` + re-fetch.
-const APPLY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+/// Throttle window for live CSS applies. The worker absorbs keystrokes for this long, applies the
+/// newest text, then loops — so the page tracks the user WHILE they type (every ~75ms + RTT),
+/// instead of only after a full quiet period (the previous debounce made live editing feel dead
+/// during continuous typing).
+const APPLY_THROTTLE: std::time::Duration = std::time::Duration::from_millis(75);
 
 /// Shared map of `styleSheetId` → metadata, populated from `CSS.styleSheetAdded` events by the
 /// session. Lets the panel decide whether an edited rule can be written back to a source file.
@@ -433,17 +435,12 @@ impl CssPanel {
 
         self._apply_task = Some(cx.spawn(async move |this, cx| {
             while let Some(mut edit) = pending_edits.next().await {
-                // Debounce: keep absorbing newer edits until a full quiet period passes.
-                loop {
-                    executor.timer(APPLY_DEBOUNCE).await;
-                    let mut newest = None;
-                    while let Ok(newer) = pending_edits.try_recv() {
-                        newest = Some(newer);
-                    }
-                    match newest {
-                        Some(newer) => edit = newer,
-                        None => break,
-                    }
+                // Throttle: absorb one short burst, then apply the newest text. Keystrokes that
+                // arrive during the apply are queued and handled by the next loop iteration, so
+                // the trailing edit is never lost and the page updates continuously while typing.
+                executor.timer(APPLY_THROTTLE).await;
+                while let Ok(newer) = pending_edits.try_recv() {
+                    edit = newer;
                 }
                 let (index, css_text) = edit;
                 let Ok(Some(target)) = this.read_with(cx, |this, _| {
@@ -452,6 +449,7 @@ impl CssPanel {
                     continue;
                 };
 
+                let apply_started = std::time::Instant::now();
                 match cdp
                     .send("CSS.setStyleTexts", set_style_edit(&target, &css_text))
                     .await
@@ -467,15 +465,27 @@ impl CssPanel {
                             })
                             .ok();
                         }
+                        log::info!(
+                            "web preview: live CSS apply + range refresh took {:?}",
+                            apply_started.elapsed()
+                        );
                     }
                     Err(error) => {
-                        // Settled text that still fails is a real problem (read-only sheet,
-                        // detached node), not a mid-token typo — surface it.
+                        // Mid-token states now reach Chrome (throttle, not debounce), and those
+                        // parse failures are expected — only surface the error if the failed text
+                        // is still what's in the editor (settled), not a snapshot the user has
+                        // already typed past.
                         log::warn!("CSS.setStyleTexts failed: {error:#}");
                         this.update(cx, |this, cx| {
-                            this.apply_error =
-                                Some("Couldn't apply this change to the page.".into());
-                            cx.notify();
+                            let settled = this
+                                .rules
+                                .get(index)
+                                .is_some_and(|rule| rule.editor.read(cx).text(cx) == css_text);
+                            if settled {
+                                this.apply_error =
+                                    Some("Couldn't apply this change to the page.".into());
+                                cx.notify();
+                            }
                         })
                         .ok();
                     }
@@ -944,6 +954,9 @@ impl Render for CssPanel {
                         )
                     }),
             )
-            .child(div().flex_1().child(body))
+            // `min_h_0` is what makes the rules list scrollable: without it this flex child
+            // refuses to shrink below its content height, the scroll container inside is never
+            // height-bounded, and long rule lists are simply cut off at the panel edge.
+            .child(div().flex_1().min_h_0().overflow_hidden().child(body))
     }
 }
