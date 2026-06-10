@@ -83,7 +83,9 @@ fn main() {
         cx.spawn(async move |cx| {
             let artifacts = std::env::temp_dir().join("web-preview-doctor");
             std::fs::create_dir_all(&artifacts).ok();
-            let mut doctor = Doctor { results: Vec::new() };
+            let mut doctor = Doctor {
+                results: Vec::new(),
+            };
             if let Err(error) = run(&mut doctor, &artifacts, cx).await {
                 doctor.report("doctor run aborted", false, format!("{error:#}"));
             }
@@ -102,7 +104,8 @@ async fn run(
     let scale: f32 = env_or("DOCTOR_SCALE", "2").parse().unwrap_or(2.0);
     let (vp_w, vp_h) = (1280u32, 800u32);
     let executor = cx.background_executor().clone();
-    let http_client: Arc<dyn http_client::HttpClient> = Arc::new(reqwest_client::ReqwestClient::new());
+    let http_client: Arc<dyn http_client::HttpClient> =
+        Arc::new(reqwest_client::ReqwestClient::new());
 
     println!("Looking Glass doctor — url={url} scale={scale} viewport={vp_w}x{vp_h}\n");
 
@@ -110,9 +113,14 @@ async fn run(
     let reachable = dev_server::is_reachable(&url, http_client.clone()).await;
     doctor.report("dev server reachable", reachable, url.clone());
     if !reachable {
-        dev_server::wait_until_ready(&url, http_client.clone(), executor.clone(), Duration::from_secs(15))
-            .await
-            .context("dev server never became reachable — start it and re-run")?;
+        dev_server::wait_until_ready(
+            &url,
+            http_client.clone(),
+            executor.clone(),
+            Duration::from_secs(15),
+        )
+        .await
+        .context("dev server never became reachable — start it and re-run")?;
     }
 
     // Stage 2: locate Chrome (real chrome module; WEB_PREVIEW_CHROME overrides).
@@ -134,7 +142,11 @@ async fn run(
     )
     .await
     .context("launching chrome")?;
-    doctor.report("chrome launched + CDP endpoints discovered", true, format!("port {port}"));
+    doctor.report(
+        "chrome launched + CDP endpoints discovered",
+        true,
+        format!("port {port}"),
+    );
 
     // Stage 4: CDP connect over the browser endpoint (real CdpClient via gpui_tokio).
     let cdp = CdpClient::connect(process.ws_url.clone(), cx)
@@ -197,7 +209,11 @@ async fn run(
         (vp_h as f32 * scale.max(1.0)).round() as u32,
     );
     screencast::start(&cdp, 80, cap_w, cap_h).await?;
-    doctor.report("viewport set + screencast started", true, format!("capture {cap_w}x{cap_h}"));
+    doctor.report(
+        "viewport set + screencast started",
+        true,
+        format!("capture {cap_w}x{cap_h}"),
+    );
 
     // Stage 9: first frame (a static page sends exactly one settled frame — this catches the
     // dead-preview bug where the subscription raced the screencast start).
@@ -206,7 +222,11 @@ async fn run(
         Ok(Some(params)) => params,
         Ok(None) => anyhow::bail!("frame stream closed before first frame"),
         Err(_) => {
-            doctor.report("first screencast frame", false, "no frame within 10s — preview would be blank");
+            doctor.report(
+                "first screencast frame",
+                false,
+                "no frame within 10s — preview would be blank",
+            );
             anyhow::bail!("no first frame");
         }
     };
@@ -246,7 +266,10 @@ async fn run(
         sharp,
         format!(
             "decoded {}x{} (expected {cap_w}x{cap_h}); metadata CSS {}x{}",
-            size.width.0, size.height.0, decoded.metadata.device_width, decoded.metadata.device_height
+            size.width.0,
+            size.height.0,
+            decoded.metadata.device_width,
+            decoded.metadata.device_height
         ),
     );
     if let Some(data) = params.get("data").and_then(Value::as_str) {
@@ -365,7 +388,10 @@ async fn run(
         }
 
         let Ok(resolved) = cdp
-            .send("DOM.resolveNode", json!({ "backendNodeId": backend_node_id }))
+            .send(
+                "DOM.resolveNode",
+                json!({ "backendNodeId": backend_node_id }),
+            )
             .await
         else {
             continue;
@@ -388,7 +414,11 @@ async fn run(
     }
     doctor.report("element hit-test at probe points", hit_test_ok, "");
     doctor.report("frontend nodeId for CSS panel", node_id_ok, "");
-    doctor.report("CSS panel rules load", css_rules > 0, format!("{css_rules} matched rules"));
+    doctor.report(
+        "CSS panel rules load",
+        css_rules > 0,
+        format!("{css_rules} matched rules"),
+    );
     match &best_resolution {
         Some(Resolution::Source(location)) => doctor.report(
             "pick resolves to source",
@@ -436,7 +466,8 @@ async fn run(
     }
 
     // Stage 13: reload survival — loadEventFired arrives, re-init brings frames back.
-    cdp.send("Page.reload", json!({ "ignoreCache": false })).await?;
+    cdp.send("Page.reload", json!({ "ignoreCache": false }))
+        .await?;
     let load = with_timeout(&executor, Duration::from_secs(15), loads.next()).await;
     doctor.report("loadEventFired after reload", load.is_ok(), "");
     screencast::set_viewport(&cdp, vp_w, vp_h, scale).await?;

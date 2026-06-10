@@ -110,6 +110,23 @@ fn pixel_exact_placement(
     })
 }
 
+/// The always-present measure canvas that overlays the preview pane to capture its layout every
+/// frame (image_bounds for click→page mapping, preview_bounds, viewport sync). The explicit
+/// `top_0().left_0()` insets are load-bearing: GPUI elements default to block display, and an
+/// `absolute()` child with auto insets is placed at its STATIC position — i.e. BELOW the
+/// full-height `preview` sibling, one pane-height too low — making every captured image_bounds
+/// disjoint from the painted image, so every click mapped to "outside page area". Shared with the
+/// layout regression test so the test exercises the exact element production renders.
+fn overlay_measure_canvas<T: 'static>(
+    prepaint: impl 'static + FnOnce(Bounds<Pixels>, &mut Window, &mut App) -> T,
+) -> gpui::Canvas<T> {
+    canvas(prepaint, |_bounds, _, _window, _cx| {})
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+}
+
 /// Map a GPUI keystroke to the CDP `dispatchKeyEvent` fields `(key, code, windowsVirtualKeyCode,
 /// text)`. `text` is `Some` for printable characters (which insert text) and `None` for control keys.
 fn key_to_cdp(ks: &gpui::Keystroke) -> (String, String, u32, Option<String>) {
@@ -1664,44 +1681,28 @@ impl Render for WebPreviewView {
         // `img` placement above, from the decoded frame's own dimensions — as image_bounds, so
         // click→page mapping is lock-step with the pixels; (2) the panel's fractional bounds and
         // CSS size + scale, to position the next paint and push the viewport to Chrome.
-        let frame_px = self
-            .latest_frame
-            .as_ref()
-            .map(|frame| frame.image.size(0));
+        let frame_px = self.latest_frame.as_ref().map(|frame| frame.image.size(0));
         let measure = {
             let view = cx.entity().downgrade();
-            canvas(
-                move |pane_bounds, window, cx| {
-                    let scale = window.scale_factor();
-                    let image_bounds = frame_px.map(|frame| {
-                        match pixel_exact_placement(frame, pane_bounds.size, scale) {
-                            Some(placement) => Bounds::new(
-                                pane_bounds.origin + placement.origin,
-                                placement.size,
-                            ),
-                            None => ObjectFit::Contain.get_bounds(pane_bounds, frame),
+            overlay_measure_canvas(move |pane_bounds, window, cx| {
+                let scale = window.scale_factor();
+                let image_bounds = frame_px.map(|frame| {
+                    match pixel_exact_placement(frame, pane_bounds.size, scale) {
+                        Some(placement) => {
+                            Bounds::new(pane_bounds.origin + placement.origin, placement.size)
                         }
-                    });
-                    let css_w = f32::from(pane_bounds.size.width) as u32;
-                    let css_h = f32::from(pane_bounds.size.height) as u32;
-                    view.update(cx, |this, cx| {
-                        this.image_bounds = image_bounds;
-                        this.preview_bounds = Some(pane_bounds);
-                        this.sync_viewport(css_w, css_h, scale, cx);
-                    })
-                    .ok();
-                },
-                |_bounds, _, _window, _cx| {},
-            )
-            .absolute()
-            // Explicit insets are load-bearing: an absolutely-positioned element WITHOUT them is
-            // laid out at its *static position* (below/after its sibling), not at the parent's
-            // origin. This canvas then reported a rect hanging past the pane's bottom edge, so
-            // every click was "outside page area" and the garbage size was even pushed to Chrome
-            // as the viewport (observed live: image_bounds origin y=745 in a pane starting at
-            // y=75, with all clicks ignored).
-            .inset_0()
-            .size_full()
+                        None => ObjectFit::Contain.get_bounds(pane_bounds, frame),
+                    }
+                });
+                let css_w = f32::from(pane_bounds.size.width) as u32;
+                let css_h = f32::from(pane_bounds.size.height) as u32;
+                view.update(cx, |this, cx| {
+                    this.image_bounds = image_bounds;
+                    this.preview_bounds = Some(pane_bounds);
+                    this.sync_viewport(css_w, css_h, scale, cx);
+                })
+                .ok();
+            })
         };
 
         v_flex()
@@ -1822,6 +1823,97 @@ mod tests {
             2.0,
         );
         assert!(placement.is_none());
+    }
+
+    /// Regression test for the dead-clicks bug: the measure canvas is `.absolute()` and laid out
+    /// AFTER the full-height preview child inside a default (block-display) parent. Without
+    /// explicit `top_0().left_0()` insets, GPUI places it at its STATIC position — one pane-height
+    /// BELOW the preview — so every captured image_bounds was disjoint from the painted image and
+    /// every click mapped to "outside page area". Renders `overlay_measure_canvas` (the exact
+    /// element production uses) in the same element structure as `WebPreviewView::render`.
+    #[gpui::test]
+    fn measure_canvas_overlays_the_preview_instead_of_landing_below_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{Render, canvas, div, prelude::*};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        const HEADER_HEIGHT: f32 = 40.0;
+        const CSS_PANEL_WIDTH: f32 = 320.0;
+
+        struct MeasureProbe {
+            preview_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+            measure_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+        }
+
+        impl Render for MeasureProbe {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                let preview_bounds = self.preview_bounds.clone();
+                let measure_bounds = self.measure_bounds.clone();
+                // Mirrors the production tree: v_flex root → header → h_flex → relative pane
+                // holding a full-size preview child followed by the absolute measure canvas.
+                let preview = div().size_full().child(
+                    canvas(
+                        move |bounds, _window, _cx| preview_bounds.set(Some(bounds)),
+                        |_bounds, _, _window, _cx| {},
+                    )
+                    .size_full(),
+                );
+                let measure = overlay_measure_canvas(move |bounds, _window, _cx| {
+                    measure_bounds.set(Some(bounds))
+                });
+                div()
+                    .flex()
+                    .flex_col()
+                    .size_full()
+                    .child(div().w_full().h(px(HEADER_HEIGHT)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .size_full()
+                            .child(
+                                div()
+                                    .relative()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .overflow_hidden()
+                                    .child(preview)
+                                    .child(measure),
+                            )
+                            .child(div().flex_none().w(px(CSS_PANEL_WIDTH)).h_full()),
+                    )
+            }
+        }
+
+        let preview_bounds = Rc::new(Cell::new(None));
+        let measure_bounds = Rc::new(Cell::new(None));
+        let (_view, cx) = cx.add_window_view(|_window, _cx| MeasureProbe {
+            preview_bounds: preview_bounds.clone(),
+            measure_bounds: measure_bounds.clone(),
+        });
+        cx.run_until_parked();
+
+        let viewport = cx.update(|window, _cx| window.viewport_size());
+        let preview_bounds = preview_bounds
+            .get()
+            .expect("preview was laid out and prepainted");
+        let measure_bounds = measure_bounds
+            .get()
+            .expect("measure canvas was laid out and prepainted");
+
+        // The pane must actually be on screen for the comparison to mean anything.
+        assert!(f32::from(preview_bounds.size.height) > 0.0);
+        assert!(preview_bounds.origin.y < viewport.height);
+        // The canvas must overlay the preview exactly — NOT sit at its static position one
+        // pane-height further down (which put image_bounds off-screen and killed every click).
+        assert_eq!(measure_bounds, preview_bounds);
     }
 
     #[test]

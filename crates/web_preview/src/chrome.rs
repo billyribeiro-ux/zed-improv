@@ -123,7 +123,10 @@ pub async fn launch(
         // only ever downscale (verified against Chrome 149). Forcing the window scale here is the
         // only way to get physical-resolution frames while CSS layout and input coordinates stay
         // at the panel's CSS size.
-        .arg(format!("--force-device-scale-factor={}", device_scale.max(1.0)))
+        .arg(format!(
+            "--force-device-scale-factor={}",
+            device_scale.max(1.0)
+        ))
         .arg("--hide-scrollbars")
         .arg("--no-first-run")
         .arg("--no-default-browser-check")

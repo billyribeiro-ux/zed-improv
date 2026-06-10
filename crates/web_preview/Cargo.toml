@@ -13,6 +13,7 @@ path = "src/web_preview.rs"
 
 [dev-dependencies]
 env_logger.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
 gpui_platform.workspace = true
 reqwest_client.workspace = true
 
