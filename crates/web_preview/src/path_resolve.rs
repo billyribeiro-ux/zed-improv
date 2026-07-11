@@ -57,6 +57,60 @@ fn resolve_from_worktrees(worktrees: &[PathBuf], reported: &str) -> Option<PathB
         }
     }
 
+    // 4. The INVERSE monorepo skew: the dev server runs from a subdirectory of the worktree
+    //    (e.g. a repo opened at its root with the app in `frontend/`), so the reported
+    //    dev-server-relative path is MISSING leading segments. Breadth-first search the
+    //    worktree's subdirectories and try the relative path under each — shallowest match
+    //    wins, dependency/build directories are skipped.
+    for root in worktrees {
+        if let Some(found) = resolve_under_subdirectories(root, relative) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+/// Directories never searched for an app root: dependencies and build output can shadow the real
+/// source file (e.g. `node_modules/<pkg>/src/…`, `.svelte-kit/output/…`).
+const UNSEARCHED_DIRS: &[&str] = &["node_modules", "target", "dist", "build", "out", "vendor"];
+
+/// How deep below the worktree root to look for the dev server's app root. Depth 3 covers
+/// `frontend/`, `apps/web/`, and `packages/apps/web/` style layouts without walking whole trees.
+const MAX_APP_ROOT_DEPTH: usize = 3;
+
+fn resolve_under_subdirectories(root: &Path, relative: &str) -> Option<PathBuf> {
+    let mut queue = std::collections::VecDeque::from([(root.to_path_buf(), 0usize)]);
+    while let Some((directory, depth)) = queue.pop_front() {
+        // Depth 0 is the worktree root itself, which strategy 2 already tried.
+        if depth > 0 {
+            let candidate = directory.join(relative);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        if depth == MAX_APP_ROOT_DEPTH {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut subdirectories: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !name.starts_with('.') && !UNSEARCHED_DIRS.contains(&name))
+            })
+            .collect();
+        // Sorted so ties at the same depth resolve deterministically.
+        subdirectories.sort();
+        for subdirectory in subdirectories {
+            queue.push_back((subdirectory, depth + 1));
+        }
+    }
     None
 }
 
@@ -176,6 +230,42 @@ mod tests {
             strip_to_path("file:///Users/me/My%20App/src/Foo.svelte"),
             "/Users/me/My App/src/Foo.svelte"
         );
+    }
+
+    /// The case observed live: repo opened at its root, SvelteKit app in `frontend/`, Vite
+    /// reporting paths relative to `frontend/` — `src/lib/...` must resolve by INSERTING the
+    /// missing app-root segment, not just by trimming reported segments.
+    #[test]
+    fn resolves_under_app_subdirectory_of_monorepo_worktree() {
+        let root = temp_worktree();
+        fs::create_dir_all(root.join("frontend/src/lib/components/sections"))
+            .expect("create app subtree");
+        let expected = root.join("frontend/src/lib/components/sections/Hero.svelte");
+        fs::write(&expected, "").expect("write component");
+
+        assert_eq!(
+            resolve_from_worktrees(
+                std::slice::from_ref(&root),
+                "src/lib/components/sections/Hero.svelte"
+            ),
+            Some(expected)
+        );
+        fs::remove_dir_all(root).expect("remove temp worktree");
+    }
+
+    /// A copy of the file inside node_modules (or build output) must never shadow — or stand in
+    /// for — project source.
+    #[test]
+    fn app_subdirectory_search_skips_dependency_dirs() {
+        let root = temp_worktree();
+        fs::create_dir_all(root.join("node_modules/pkg/src")).expect("create dependency subtree");
+        fs::write(root.join("node_modules/pkg/src/Only.svelte"), "").expect("write dependency");
+
+        assert_eq!(
+            resolve_from_worktrees(std::slice::from_ref(&root), "src/Only.svelte"),
+            None
+        );
+        fs::remove_dir_all(root).expect("remove temp worktree");
     }
 
     #[test]

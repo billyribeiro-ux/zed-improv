@@ -34,10 +34,21 @@ pub struct CdpClient {
     inner: Arc<CdpInner>,
 }
 
-/// The page-target session id captured from `Target.attachedToTarget`. Shared so `send`/`dispatch`
+/// The page-target session captured from `Target.attachedToTarget`. Shared so `send`/`dispatch`
 /// can stamp and route page-scoped traffic, and so it can be updated when Chrome re-attaches the
 /// page target after a reload — which is what lets the session survive a page refresh.
-type PageSession = Arc<Mutex<Option<String>>>;
+///
+/// The session is PINNED to the first page target's `targetId`: `Target.setAutoAttach` at the
+/// browser endpoint attaches to every new top-level page, so a `window.open()` / `target=_blank`
+/// popup in the previewed app would otherwise capture the session and silently reroute all input,
+/// screencast acks, and CSS commands to the invisible popup, freezing the preview. A reload keeps
+/// the tab's `targetId`, so re-attach after refresh still updates the session id.
+#[derive(Default)]
+struct PageTargetState {
+    session_id: Option<String>,
+    target_id: Option<String>,
+}
+type PageSession = Arc<Mutex<PageTargetState>>;
 
 /// Page-scoped CDP domains: commands for these must carry the page `sessionId` when we're attached at
 /// the browser endpoint (flatten mode). `Target` itself is browser-scoped and must NOT be stamped.
@@ -100,7 +111,7 @@ impl CdpClient {
         let subscribers: EventSubscribers = Arc::new(Mutex::new(HashMap::default()));
         let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<WebSocketMessage>();
         let closed = Arc::new(AtomicBool::new(false));
-        let page_session: PageSession = Arc::new(Mutex::new(None));
+        let page_session: PageSession = Arc::new(Mutex::new(PageTargetState::default()));
         let (closed_tx, closed_rx) = oneshot::channel();
 
         let write_task = executor.spawn(async move {
@@ -193,7 +204,7 @@ impl CdpClient {
     fn build_payload(&self, id: u64, method: &str, params: Value) -> Value {
         let mut payload = json!({ "id": id, "method": method, "params": params });
         if is_page_scoped(method) {
-            if let Some(session_id) = self.inner.page_session.lock().clone() {
+            if let Some(session_id) = self.inner.page_session.lock().session_id.clone() {
                 payload["sessionId"] = Value::String(session_id);
             }
         }
@@ -202,7 +213,7 @@ impl CdpClient {
 
     /// The current page session id, if attached via the browser endpoint.
     pub fn page_session(&self) -> Option<String> {
-        self.inner.page_session.lock().clone()
+        self.inner.page_session.lock().session_id.clone()
     }
 
     /// Send a CDP method call and await its result. `params` is the raw params object (use
@@ -276,18 +287,41 @@ fn dispatch(
         let params = message.get("params").cloned().unwrap_or(Value::Null);
 
         // Capture the page-target session id so subsequent page-scoped commands can be stamped, and
-        // update it whenever Chrome re-attaches the page target (e.g. after a reload). This is what
-        // lets the session survive a page refresh.
+        // update it whenever Chrome re-attaches the SAME page target (e.g. after a reload, which
+        // keeps the tab's targetId). This is what lets the session survive a page refresh. Attaches
+        // to OTHER page targets (window.open / target=_blank popups, which browser-level auto-attach
+        // also delivers) are ignored — adopting them would reroute all input and screencast acks to
+        // the invisible popup and freeze the preview.
         if method == "Target.attachedToTarget" {
-            let is_page = params
-                .get("targetInfo")
+            let target_info = params.get("targetInfo");
+            let is_page = target_info
                 .and_then(|info| info.get("type"))
                 .and_then(Value::as_str)
                 == Some("page");
             if is_page {
-                if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
-                    *page_session.lock() = Some(session_id.to_string());
-                    log::info!("web preview: attached to page target (session captured)");
+                let session_id = params.get("sessionId").and_then(Value::as_str);
+                let target_id = target_info
+                    .and_then(|info| info.get("targetId"))
+                    .and_then(Value::as_str);
+                if let (Some(session_id), Some(target_id)) = (session_id, target_id) {
+                    let mut state = page_session.lock();
+                    match state.target_id.as_deref() {
+                        None => {
+                            state.target_id = Some(target_id.to_string());
+                            state.session_id = Some(session_id.to_string());
+                            log::info!("web preview: attached to page target (session captured)");
+                        }
+                        Some(pinned) if pinned == target_id => {
+                            state.session_id = Some(session_id.to_string());
+                            log::info!("web preview: re-attached to page target (session updated)");
+                        }
+                        Some(_) => {
+                            log::info!(
+                                "web preview: ignoring attach to other page target {target_id} \
+                                 (popup/new tab)"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -313,4 +347,56 @@ fn response_result(message: &Value) -> Result<Value> {
         bail!("CDP error {code}: {cdp_message}");
     }
     Ok(message.get("result").cloned().unwrap_or(Value::Null))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dispatch_attached(page_session: &PageSession, target_id: &str, session_id: &str) {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::default()));
+        let subscribers: EventSubscribers = Arc::new(Mutex::new(HashMap::default()));
+        let event = json!({
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": session_id,
+                "targetInfo": { "targetId": target_id, "type": "page" },
+            },
+        })
+        .to_string();
+        dispatch(&event, &pending, &subscribers, page_session);
+    }
+
+    #[test]
+    fn first_page_attach_captures_session_and_pins_target() {
+        let page_session: PageSession = Default::default();
+        dispatch_attached(&page_session, "tab-1", "session-a");
+        let state = page_session.lock();
+        assert_eq!(state.session_id.as_deref(), Some("session-a"));
+        assert_eq!(state.target_id.as_deref(), Some("tab-1"));
+    }
+
+    #[test]
+    fn popup_attach_does_not_hijack_the_session() {
+        // window.open / target=_blank creates a new page target which browser-level auto-attach
+        // also delivers; adopting it would reroute all input/acks to the invisible popup.
+        let page_session: PageSession = Default::default();
+        dispatch_attached(&page_session, "tab-1", "session-a");
+        dispatch_attached(&page_session, "popup-2", "session-b");
+        let state = page_session.lock();
+        assert_eq!(state.session_id.as_deref(), Some("session-a"));
+        assert_eq!(state.target_id.as_deref(), Some("tab-1"));
+    }
+
+    #[test]
+    fn reload_reattach_to_same_target_updates_the_session() {
+        // A reload keeps the tab's targetId but issues a fresh sessionId — that one must be adopted
+        // or the preview dies after refresh.
+        let page_session: PageSession = Default::default();
+        dispatch_attached(&page_session, "tab-1", "session-a");
+        dispatch_attached(&page_session, "tab-1", "session-c");
+        let state = page_session.lock();
+        assert_eq!(state.session_id.as_deref(), Some("session-c"));
+        assert_eq!(state.target_id.as_deref(), Some("tab-1"));
+    }
 }

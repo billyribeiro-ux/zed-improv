@@ -34,9 +34,11 @@ use workspace::Toast;
 use workspace::Workspace;
 use workspace::notifications::NotificationId;
 
-/// How long to wait for typing to settle before applying a live CSS edit. Coalesces a burst of
-/// keystrokes into a single `CSS.setStyleTexts` + re-fetch.
-const APPLY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+/// Throttle window for live CSS applies. The worker absorbs keystrokes for this long, applies the
+/// newest text, then loops — so the page tracks the user WHILE they type (every ~75ms + RTT),
+/// instead of only after a full quiet period (the previous debounce made live editing feel dead
+/// during continuous typing).
+const APPLY_THROTTLE: std::time::Duration = std::time::Duration::from_millis(75);
 
 /// Shared map of `styleSheetId` → metadata, populated from `CSS.styleSheetAdded` events by the
 /// session. Lets the panel decide whether an edited rule can be written back to a source file.
@@ -161,6 +163,12 @@ struct RuleEntry {
     route: WriteRoute,
     selector: SharedString,
     editor: Entity<Editor>,
+    /// The persisted declaration text this editor is measured against: the text at pick time,
+    /// advanced on every successful Apply. While the editor differs from it the rule is "dirty"
+    /// and the Apply/Ignore buttons are shown; Ignore restores it (which also live-reverts the
+    /// page, since setting the editor text re-applies through the normal live path).
+    baseline_css: String,
+    dirty: bool,
     /// Failure of the most recent Write attempt for THIS rule, shown inline. Kept per-rule so one
     /// failed write doesn't blank the whole panel.
     write_error: Option<SharedString>,
@@ -195,6 +203,16 @@ enum Status {
     Editing,
     Error(SharedString),
 }
+
+/// Events the panel raises for the owning preview view.
+pub enum CssPanelEvent {
+    /// The user pressed Escape in the panel (or in one of its rule editors with nothing to
+    /// dismiss): hand focus back to the preview and re-arm pick mode so another element can be
+    /// chosen.
+    PickAnother,
+}
+
+impl gpui::EventEmitter<CssPanelEvent> for CssPanel {}
 
 impl CssPanel {
     pub fn new(
@@ -293,6 +311,13 @@ impl CssPanel {
                 cx.subscribe(&editor, move |this, editor, event: &EditorEvent, cx| {
                     if matches!(event, EditorEvent::BufferEdited) {
                         let text = editor.read(cx).text(cx);
+                        if let Some(rule) = this.rules.get_mut(index) {
+                            let dirty = text != rule.baseline_css;
+                            if rule.dirty != dirty {
+                                rule.dirty = dirty;
+                                cx.notify();
+                            }
+                        }
                         this.apply_live(index, text, cx);
                     }
                 });
@@ -310,6 +335,8 @@ impl CssPanel {
                 route,
                 selector: selector.into(),
                 editor,
+                baseline_css: rule.css_text,
+                dirty: false,
                 write_error: None,
                 _subscription: subscription,
             });
@@ -408,17 +435,12 @@ impl CssPanel {
 
         self._apply_task = Some(cx.spawn(async move |this, cx| {
             while let Some(mut edit) = pending_edits.next().await {
-                // Debounce: keep absorbing newer edits until a full quiet period passes.
-                loop {
-                    executor.timer(APPLY_DEBOUNCE).await;
-                    let mut newest = None;
-                    while let Ok(newer) = pending_edits.try_recv() {
-                        newest = Some(newer);
-                    }
-                    match newest {
-                        Some(newer) => edit = newer,
-                        None => break,
-                    }
+                // Throttle: absorb one short burst, then apply the newest text. Keystrokes that
+                // arrive during the apply are queued and handled by the next loop iteration, so
+                // the trailing edit is never lost and the page updates continuously while typing.
+                executor.timer(APPLY_THROTTLE).await;
+                while let Ok(newer) = pending_edits.try_recv() {
+                    edit = newer;
                 }
                 let (index, css_text) = edit;
                 let Ok(Some(target)) = this.read_with(cx, |this, _| {
@@ -427,6 +449,7 @@ impl CssPanel {
                     continue;
                 };
 
+                let apply_started = std::time::Instant::now();
                 match cdp
                     .send("CSS.setStyleTexts", set_style_edit(&target, &css_text))
                     .await
@@ -442,15 +465,27 @@ impl CssPanel {
                             })
                             .ok();
                         }
+                        log::info!(
+                            "web preview: live CSS apply + range refresh took {:?}",
+                            apply_started.elapsed()
+                        );
                     }
                     Err(error) => {
-                        // Settled text that still fails is a real problem (read-only sheet,
-                        // detached node), not a mid-token typo — surface it.
+                        // Mid-token states now reach Chrome (throttle, not debounce), and those
+                        // parse failures are expected — only surface the error if the failed text
+                        // is still what's in the editor (settled), not a snapshot the user has
+                        // already typed past.
                         log::warn!("CSS.setStyleTexts failed: {error:#}");
                         this.update(cx, |this, cx| {
-                            this.apply_error =
-                                Some("Couldn't apply this change to the page.".into());
-                            cx.notify();
+                            let settled = this
+                                .rules
+                                .get(index)
+                                .is_some_and(|rule| rule.editor.read(cx).text(cx) == css_text);
+                            if settled {
+                                this.apply_error =
+                                    Some("Couldn't apply this change to the page.".into());
+                                cx.notify();
+                            }
                         })
                         .ok();
                     }
@@ -498,6 +533,26 @@ impl CssPanel {
             .ok();
     }
 
+    /// Whether an element's styles are currently loaded (a node has been picked).
+    pub fn has_node(&self) -> bool {
+        self.node_id.is_some()
+    }
+
+    /// Ignore: restore rule `index` to its baseline (last persisted) text. Setting the editor text
+    /// fires the normal `BufferEdited` path, which live-applies the baseline back to the page and
+    /// clears the dirty flag.
+    fn revert_rule(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rule) = self.rules.get_mut(index) else {
+            return;
+        };
+        let baseline = rule.baseline_css.clone();
+        rule.write_error = None;
+        rule.editor.update(cx, |editor, cx| {
+            editor.set_text(baseline, window, cx);
+        });
+        cx.notify();
+    }
+
     /// Persist rule `index` to source: deterministically when its route is a file, else via agent.
     fn write_rule_to_source(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(rule) = self.rules.get(index) else {
@@ -513,7 +568,21 @@ impl CssPanel {
             WriteRoute::Source(abs_path) => {
                 self.write_deterministic(index, abs_path, &css_text, &target, window, cx)
             }
-            WriteRoute::Agent => self.write_via_agent(&css_text, &target, window, cx),
+            WriteRoute::Agent => self.write_via_agent(index, &css_text, &target, window, cx),
+        }
+    }
+
+    /// Mark rule `index` as persisted at `css_text`: it becomes the new baseline (so the
+    /// Apply/Ignore buttons retire) AND the new drift-guard reference — after a successful write
+    /// the on-disk declaration IS `css_text`, so keeping the pick-time `original_css` would make
+    /// every subsequent Apply on this rule falsely report drift and refuse to write.
+    fn mark_persisted(&mut self, index: usize, css_text: &str, cx: &mut Context<Self>) {
+        if let Some(rule) = self.rules.get_mut(index) {
+            rule.baseline_css = css_text.to_string();
+            rule.dirty = rule.editor.read(cx).text(cx) != rule.baseline_css;
+            rule.loaded_target.original_css = css_text.to_string();
+            rule.write_error = None;
+            cx.notify();
         }
     }
 
@@ -546,7 +615,7 @@ impl CssPanel {
     ) {
         if !abs_path.exists() {
             // The file moved/disappeared since the route was resolved; degrade to the agent path.
-            self.write_via_agent(css_text, target, window, cx);
+            self.write_via_agent(index, css_text, target, window, cx);
             return;
         }
         let project = self.project.clone();
@@ -594,10 +663,7 @@ impl CssPanel {
                 Ok(WriteOutcome::Written) => {
                     this.notify("Saved to source".to_string(), cx);
                     this.clear_apply_error(cx);
-                    if let Some(rule) = this.rules.get_mut(index) {
-                        rule.write_error = None;
-                        cx.notify();
-                    }
+                    this.mark_persisted(index, &css_text, cx);
                 }
                 Ok(WriteOutcome::Drifted) => {
                     this.set_write_error(
@@ -630,9 +696,12 @@ impl CssPanel {
     }
 
     /// Agent fallback for rules with no deterministic source range. Best-effort opens the agent
-    /// panel pre-filled with a prompt; if unavailable, copies the prompt to the clipboard.
+    /// panel pre-filled with a prompt; if unavailable, copies the prompt to the clipboard. Either
+    /// way the change is considered handed off, so the rule's baseline advances (the live edit
+    /// stays applied on the page; finalizing the source is the agent's job from here).
     fn write_via_agent(
         &mut self,
+        index: usize,
         css_text: &str,
         target: &EditTarget,
         window: &mut Window,
@@ -647,6 +716,7 @@ impl CssPanel {
             })
             .unwrap_or(false);
 
+        self.mark_persisted(index, css_text, cx);
         if opened {
             return;
         }
@@ -778,6 +848,7 @@ impl Render for CssPanel {
                 let rows = self.rules.iter().enumerate().map(|(index, rule)| {
                     let route_label = rule.route.label();
                     let write_error = rule.write_error.clone();
+                    let dirty = rule.dirty;
                     v_flex()
                         .gap_0p5()
                         .py_1()
@@ -800,17 +871,34 @@ impl Render for CssPanel {
                                                 .size(LabelSize::XSmall)
                                                 .color(Color::Muted),
                                         )
-                                        .child(
-                                            ui::Button::new(("write", index), "Write")
-                                                .tooltip(Tooltip::text(
-                                                    "Save this rule to source (or hand off to the agent)",
-                                                ))
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        this.write_rule_to_source(index, window, cx);
-                                                    },
-                                                )),
-                                        ),
+                                        // Edits already show live on the page; Apply persists
+                                        // them (file write or agent handoff), Ignore reverts the
+                                        // editor — and thus the page — to the last persisted text.
+                                        .when(dirty, |this| {
+                                            this.child(
+                                                ui::Button::new(("ignore", index), "Ignore")
+                                                    .tooltip(Tooltip::text(
+                                                        "Discard this change and restore the page",
+                                                    ))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            this.revert_rule(index, window, cx);
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                ui::Button::new(("apply", index), "Apply")
+                                                    .style(ui::ButtonStyle::Filled)
+                                                    .tooltip(Tooltip::text(
+                                                        "Save this rule to source (or hand off to the agent)",
+                                                    ))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            this.write_rule_to_source(index, window, cx);
+                                                        },
+                                                    )),
+                                            )
+                                        }),
                                 ),
                         )
                         .child(div().px_2().child(rule.editor.clone()))
@@ -837,6 +925,17 @@ impl Render for CssPanel {
 
         let apply_error = self.apply_error.clone();
         v_flex()
+            .key_context("CssPanel")
+            .track_focus(&self.focus_handle)
+            // Escape returns to picking: directly via the global menu::Cancel binding, and via
+            // editor::Cancel bubbling out of a rule editor that had nothing of its own to dismiss
+            // (Editor::cancel propagates in that case).
+            .on_action(cx.listener(|_, _: &menu::Cancel, _window, cx| {
+                cx.emit(CssPanelEvent::PickAnother);
+            }))
+            .on_action(cx.listener(|_, _: &editor::actions::Cancel, _window, cx| {
+                cx.emit(CssPanelEvent::PickAnother);
+            }))
             .size_full()
             .bg(colors.panel_background)
             .child(
@@ -855,6 +954,9 @@ impl Render for CssPanel {
                         )
                     }),
             )
-            .child(div().flex_1().child(body))
+            // `min_h_0` is what makes the rules list scrollable: without it this flex child
+            // refuses to shrink below its content height, the scroll container inside is never
+            // height-bounded, and long rule lists are simply cut off at the panel edge.
+            .child(div().flex_1().min_h_0().overflow_hidden().child(body))
     }
 }

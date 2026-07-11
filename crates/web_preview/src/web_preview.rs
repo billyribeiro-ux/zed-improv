@@ -23,7 +23,7 @@ pub mod web_preview_settings;
 
 use anyhow::{Context as _, Result};
 use cdp::CdpClient;
-use css_panel::CssPanel;
+use css_panel::{CssPanel, CssPanelEvent};
 use futures::StreamExt as _;
 use gpui::{
     AnyElement, AnyWindowHandle, App, AppContext as _, Bounds, Entity, EventEmitter, FocusHandle,
@@ -108,6 +108,23 @@ fn pixel_exact_placement(
             gpui::size(px(target_width), px(target_height)),
         )
     })
+}
+
+/// The always-present measure canvas that overlays the preview pane to capture its layout every
+/// frame (image_bounds for click→page mapping, preview_bounds, viewport sync). The explicit
+/// `top_0().left_0()` insets are load-bearing: GPUI elements default to block display, and an
+/// `absolute()` child with auto insets is placed at its STATIC position — i.e. BELOW the
+/// full-height `preview` sibling, one pane-height too low — making every captured image_bounds
+/// disjoint from the painted image, so every click mapped to "outside page area". Shared with the
+/// layout regression test so the test exercises the exact element production renders.
+fn overlay_measure_canvas<T: 'static>(
+    prepaint: impl 'static + FnOnce(Bounds<Pixels>, &mut Window, &mut App) -> T,
+) -> gpui::Canvas<T> {
+    canvas(prepaint, |_bounds, _, _window, _cx| {})
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
 }
 
 /// Map a GPUI keystroke to the CDP `dispatchKeyEvent` fields `(key, code, windowsVirtualKeyCode,
@@ -287,6 +304,10 @@ pub struct WebPreviewView {
     /// `--force-device-scale-factor` so the screencast captures at physical (retina) resolution.
     /// Launch-time only: Chrome's window scale can't be changed at runtime.
     launch_scale: f32,
+    /// Whether the last paint used the pixel-exact (1:1, sharp) path. Tracked only to log the
+    /// TRANSITIONS between sharp and scaled-fit (soft) painting, so a persistently blurry preview
+    /// is diagnosable from the log.
+    exact_paint_engaged: Option<bool>,
     /// Debounce task for viewport re-sync on resize.
     _viewport_task: Option<Task<()>>,
     css_panel: Entity<CssPanel>,
@@ -318,6 +339,20 @@ impl WebPreviewView {
                 cx,
             )
         });
+        // Escape in the CSS panel (or one of its rule editors) returns to picking: focus the
+        // preview and re-arm pick mode so the user can choose another element. Detached: the view
+        // owns the panel, so both ends live exactly as long as the view.
+        cx.subscribe_in(
+            &css_panel,
+            window,
+            |this, _, event: &CssPanelEvent, window, cx| match event {
+                CssPanelEvent::PickAnother => {
+                    window.focus(&this.focus_handle, cx);
+                    this.set_pick_mode(true, cx);
+                }
+            },
+        )
+        .detach();
         // Release any GPU frame textures still retained when the view is dropped.
         cx.on_release(|this, cx| {
             for frame in [
@@ -353,6 +388,7 @@ impl WebPreviewView {
             panel_px: None,
             viewport_metrics: None,
             launch_scale: window.scale_factor(),
+            exact_paint_engaged: None,
             _viewport_task: None,
             css_panel,
             style_sheets,
@@ -677,7 +713,13 @@ impl WebPreviewView {
             .max(1);
         let frame_interval = Duration::from_millis(33) * every_nth;
         let frame_task = cx.spawn(async move |this, cx| {
-            let mut first_frame_rendered = false;
+            let mut last_render: Option<std::time::Instant> = None;
+            // Rolling stream-health stats, reported every ~5s so "the preview feels slow/blurry"
+            // is diagnosable from the log instead of guesswork.
+            let mut report_started = std::time::Instant::now();
+            let mut frames_rendered = 0u32;
+            let mut frames_skipped = 0u32;
+            let mut decode_total = Duration::ZERO;
             while let Some(mut params) = frames.next().await {
                 // Drain to the latest queued frame: if we've fallen behind (decode/render slower than
                 // the stream), skip stale frames and only process the freshest, so the preview never
@@ -686,6 +728,7 @@ impl WebPreviewView {
                     if let Some(sid) = screencast::session_id(&params) {
                         screencast::ack_no_reply(&frame_cdp, sid);
                     }
+                    frames_skipped += 1;
                     params = newer;
                 }
                 // Ack the frame we're about to render (fire-and-forget — the ack has no useful
@@ -693,11 +736,26 @@ impl WebPreviewView {
                 if let Some(session_id) = screencast::session_id(&params) {
                     screencast::ack_no_reply(&frame_cdp, session_id);
                 }
+                let decode_started = std::time::Instant::now();
                 let decoded = cx
                     .background_spawn(async move { screencast::decode_frame(&params) })
                     .await;
+                decode_total += decode_started.elapsed();
                 match decoded {
                     Ok(frame) => {
+                        // Pace against the wall clock: only sleep the REMAINDER of the frame
+                        // budget not already spent decoding, so the period is
+                        // max(decode, interval), not decode + interval — sleeping the full
+                        // interval after a slow decode halved the effective frame rate. The
+                        // first frame is never delayed, so static pages paint immediately.
+                        if let Some(last) = last_render {
+                            let elapsed = last.elapsed();
+                            if elapsed < frame_interval {
+                                cx.background_executor()
+                                    .timer(frame_interval - elapsed)
+                                    .await;
+                            }
+                        }
                         let dropped = this.update(cx, |this, cx| {
                             let previous = this.latest_frame.replace(frame);
                             cx.notify();
@@ -706,10 +764,21 @@ impl WebPreviewView {
                         if dropped.is_err() {
                             break;
                         }
-                        if first_frame_rendered {
-                            cx.background_executor().timer(frame_interval).await;
+                        last_render = Some(std::time::Instant::now());
+                        frames_rendered += 1;
+                        let report_elapsed = report_started.elapsed();
+                        if report_elapsed >= Duration::from_secs(5) && frames_rendered > 0 {
+                            log::info!(
+                                "web preview: stream health — {:.1} fps rendered, {} skipped, avg decode {:.1}ms",
+                                frames_rendered as f32 / report_elapsed.as_secs_f32(),
+                                frames_skipped,
+                                decode_total.as_secs_f32() * 1000.0 / frames_rendered as f32,
+                            );
+                            report_started = std::time::Instant::now();
+                            frames_rendered = 0;
+                            frames_skipped = 0;
+                            decode_total = Duration::ZERO;
                         }
-                        first_frame_rendered = true;
                     }
                     Err(error) => log::warn!("screencast frame decode failed: {error:#}"),
                 }
@@ -878,6 +947,14 @@ impl WebPreviewView {
             }
         }
 
+        // The pick highlight is a transient cue: without an explicit hide it stays painted over
+        // the page indefinitely (Overlay.highlightNode persists until hideHighlight), leaving a
+        // stuck blue box + tooltip on every picked element.
+        cx.background_executor()
+            .timer(Duration::from_millis(1200))
+            .await;
+        cdp.send_no_reply("Overlay.hideHighlight", Value::Null);
+
         Ok(())
     }
 
@@ -925,8 +1002,16 @@ impl WebPreviewView {
     /// Open the resolved source file at the exact line/column in the workspace.
     fn open_source(&mut self, location: SourceLocation, cx: &mut Context<Self>) {
         let Some(abs_path) = path_resolve::resolve(&self.project, &location.file, cx) else {
+            let roots = self
+                .project
+                .read(cx)
+                .worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
             let message = format!(
-                "Couldn't find {} in this project. If you moved the project, restart the dev server.",
+                "Couldn't find {} in this project (searched: {roots}). Open the app's folder in \
+                 this window, or restart the dev server if the project moved.",
                 location.file
             );
             log::warn!("{message}");
@@ -986,12 +1071,16 @@ impl WebPreviewView {
         self.set_pick_mode(!self.picking, cx);
     }
 
-    /// Cancel pick mode if active (bound to Esc). When not picking, the event is propagated so
-    /// Escape still reaches outer handlers AND `forward_key` can deliver it to the previewed page
-    /// (e.g. to close a modal in the user's app) — consuming it unconditionally ate every Escape.
+    /// Escape on the preview (bound via the global `menu::Cancel`): cancel pick mode if active;
+    /// otherwise, when an element's styles are already loaded, re-arm pick mode so the user can
+    /// choose another element. Only when neither applies is the event propagated, so Escape still
+    /// reaches outer handlers AND `forward_key` can deliver it to the previewed page (e.g. to
+    /// close a modal in the user's app) — consuming it unconditionally ate every Escape.
     fn cancel_pick_mode(&mut self, cx: &mut Context<Self>) {
         if self.picking {
             self.set_pick_mode(false, cx);
+        } else if self.css_panel.read(cx).has_node() {
+            self.set_pick_mode(true, cx);
         } else {
             cx.propagate();
         }
@@ -1155,12 +1244,10 @@ impl WebPreviewView {
         .detach();
     }
 
-    /// Forward a scroll wheel event to the page so the user can scroll the preview.
-    fn forward_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
-        log::info!("web preview: forward_scroll fired, delta={:?}", event.delta);
-        if self.picking {
-            return;
-        }
+    /// Forward a scroll wheel event to the page so the user can scroll the preview. Also forwards
+    /// in pick mode — scrolling is how the user reaches the next element to pick; only clicks are
+    /// repurposed while picking.
+    fn forward_scroll(&mut self, event: &ScrollWheelEvent, _cx: &mut Context<Self>) {
         let SessionState::Connected(cdp) = &self.state else {
             log::info!("web preview: scroll ignored — not connected");
             return;
@@ -1176,28 +1263,27 @@ impl WebPreviewView {
         // GPUI scroll deltas → pixels. macOS natural-scroll sign is already correct; CDP `mouseWheel`
         // follows the DOM wheel convention (positive deltaY scrolls content down), matching GPUI, so
         // NO negation (verified against real headless Chrome). Both axes must always be present.
-        let delta = event.delta.pixel_delta(px(20.0));
+        // 40px per line matches Blink's own wheel tick, so a wheel notch travels the same distance
+        // it would in a real browser (20px needed twice the events for the same distance).
+        let delta = event.delta.pixel_delta(px(40.0));
         let (delta_x, delta_y) = (f32::from(delta.x), f32::from(delta.y));
         if delta_x == 0.0 && delta_y == 0.0 {
             return;
         }
 
-        let cdp = cdp.clone();
-        cx.background_spawn(async move {
-            cdp.send(
-                "Input.dispatchMouseEvent",
-                json!({
-                    "type": "mouseWheel",
-                    "x": page_x,
-                    "y": page_y,
-                    "deltaX": delta_x,
-                    "deltaY": delta_y,
-                }),
-            )
-            .await
-            .log_err();
-        })
-        .detach();
+        // Fire-and-forget like `mouseMoved`: wheel events stream at input rate, their result is
+        // unused, and per-event pending-reply slots piled up when the renderer stalled (observed
+        // live: 13 wheel requests stuck in flight for 16s, then erroring as a batch on disconnect).
+        cdp.send_no_reply(
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseWheel",
+                "x": page_x,
+                "y": page_y,
+                "deltaX": delta_x,
+                "deltaY": delta_y,
+            }),
+        );
     }
 
     /// Forward a key press to the page over CDP. Sends `keyDown` (+ a `char` event carrying `text`
@@ -1532,6 +1618,7 @@ impl WebPreviewView {
             .child(row("⌘K ⌘⇧V", "Open Looking Glass"))
             .child(row("⌘⇧I", "Toggle pick mode (panel focused)"))
             .child(row("⌘K ⌘⇧I", "Toggle pick mode from anywhere"))
+            .child(row("esc", "Pick another element"))
             .child(
                 div()
                     .pt_1()
@@ -1539,8 +1626,9 @@ impl WebPreviewView {
                     .border_color(colors.border_variant)
                     .child(
                         Label::new(
-                            "Pick an element to jump to its source. Edit CSS on the right to see \
-                             changes live; Write saves to the source file.",
+                            "Pick an element to jump to its source. Edit CSS on the right — \
+                             changes show live in the preview. Apply saves them to source (or \
+                             hands off to the agent); Ignore restores the page.",
                         )
                         .size(LabelSize::Small)
                         .color(Color::Muted),
@@ -1584,6 +1672,21 @@ impl Render for WebPreviewView {
             let exact = self.preview_bounds.and_then(|pane| {
                 pixel_exact_placement(image.size(0), pane.size, window.scale_factor())
             });
+            if self.exact_paint_engaged != Some(exact.is_some()) {
+                self.exact_paint_engaged = Some(exact.is_some());
+                let frame_px = image.size(0);
+                if exact.is_some() {
+                    log::info!("web preview: pixel-exact paint engaged (1:1, sharp)");
+                } else {
+                    log::info!(
+                        "web preview: scaled-fit paint (SOFT) — frame {}x{} device px vs pane {:?} at scale {}; persistent soft paint means the viewport override hasn't landed",
+                        frame_px.width.0,
+                        frame_px.height.0,
+                        self.preview_bounds.map(|bounds| bounds.size),
+                        window.scale_factor(),
+                    );
+                }
+            }
             let frame_image = if let Some(placement) = exact {
                 img(image)
                     .absolute()
@@ -1664,44 +1767,28 @@ impl Render for WebPreviewView {
         // `img` placement above, from the decoded frame's own dimensions — as image_bounds, so
         // click→page mapping is lock-step with the pixels; (2) the panel's fractional bounds and
         // CSS size + scale, to position the next paint and push the viewport to Chrome.
-        let frame_px = self
-            .latest_frame
-            .as_ref()
-            .map(|frame| frame.image.size(0));
+        let frame_px = self.latest_frame.as_ref().map(|frame| frame.image.size(0));
         let measure = {
             let view = cx.entity().downgrade();
-            canvas(
-                move |pane_bounds, window, cx| {
-                    let scale = window.scale_factor();
-                    let image_bounds = frame_px.map(|frame| {
-                        match pixel_exact_placement(frame, pane_bounds.size, scale) {
-                            Some(placement) => Bounds::new(
-                                pane_bounds.origin + placement.origin,
-                                placement.size,
-                            ),
-                            None => ObjectFit::Contain.get_bounds(pane_bounds, frame),
+            overlay_measure_canvas(move |pane_bounds, window, cx| {
+                let scale = window.scale_factor();
+                let image_bounds = frame_px.map(|frame| {
+                    match pixel_exact_placement(frame, pane_bounds.size, scale) {
+                        Some(placement) => {
+                            Bounds::new(pane_bounds.origin + placement.origin, placement.size)
                         }
-                    });
-                    let css_w = f32::from(pane_bounds.size.width) as u32;
-                    let css_h = f32::from(pane_bounds.size.height) as u32;
-                    view.update(cx, |this, cx| {
-                        this.image_bounds = image_bounds;
-                        this.preview_bounds = Some(pane_bounds);
-                        this.sync_viewport(css_w, css_h, scale, cx);
-                    })
-                    .ok();
-                },
-                |_bounds, _, _window, _cx| {},
-            )
-            .absolute()
-            // Explicit insets are load-bearing: an absolutely-positioned element WITHOUT them is
-            // laid out at its *static position* (below/after its sibling), not at the parent's
-            // origin. This canvas then reported a rect hanging past the pane's bottom edge, so
-            // every click was "outside page area" and the garbage size was even pushed to Chrome
-            // as the viewport (observed live: image_bounds origin y=745 in a pane starting at
-            // y=75, with all clicks ignored).
-            .inset_0()
-            .size_full()
+                        None => ObjectFit::Contain.get_bounds(pane_bounds, frame),
+                    }
+                });
+                let css_w = f32::from(pane_bounds.size.width) as u32;
+                let css_h = f32::from(pane_bounds.size.height) as u32;
+                view.update(cx, |this, cx| {
+                    this.image_bounds = image_bounds;
+                    this.preview_bounds = Some(pane_bounds);
+                    this.sync_viewport(css_w, css_h, scale, cx);
+                })
+                .ok();
+            })
         };
 
         v_flex()
@@ -1822,6 +1909,97 @@ mod tests {
             2.0,
         );
         assert!(placement.is_none());
+    }
+
+    /// Regression test for the dead-clicks bug: the measure canvas is `.absolute()` and laid out
+    /// AFTER the full-height preview child inside a default (block-display) parent. Without
+    /// explicit `top_0().left_0()` insets, GPUI places it at its STATIC position — one pane-height
+    /// BELOW the preview — so every captured image_bounds was disjoint from the painted image and
+    /// every click mapped to "outside page area". Renders `overlay_measure_canvas` (the exact
+    /// element production uses) in the same element structure as `WebPreviewView::render`.
+    #[gpui::test]
+    fn measure_canvas_overlays_the_preview_instead_of_landing_below_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{Render, canvas, div, prelude::*};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        const HEADER_HEIGHT: f32 = 40.0;
+        const CSS_PANEL_WIDTH: f32 = 320.0;
+
+        struct MeasureProbe {
+            preview_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+            measure_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+        }
+
+        impl Render for MeasureProbe {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                let preview_bounds = self.preview_bounds.clone();
+                let measure_bounds = self.measure_bounds.clone();
+                // Mirrors the production tree: v_flex root → header → h_flex → relative pane
+                // holding a full-size preview child followed by the absolute measure canvas.
+                let preview = div().size_full().child(
+                    canvas(
+                        move |bounds, _window, _cx| preview_bounds.set(Some(bounds)),
+                        |_bounds, _, _window, _cx| {},
+                    )
+                    .size_full(),
+                );
+                let measure = overlay_measure_canvas(move |bounds, _window, _cx| {
+                    measure_bounds.set(Some(bounds))
+                });
+                div()
+                    .flex()
+                    .flex_col()
+                    .size_full()
+                    .child(div().w_full().h(px(HEADER_HEIGHT)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .size_full()
+                            .child(
+                                div()
+                                    .relative()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .overflow_hidden()
+                                    .child(preview)
+                                    .child(measure),
+                            )
+                            .child(div().flex_none().w(px(CSS_PANEL_WIDTH)).h_full()),
+                    )
+            }
+        }
+
+        let preview_bounds = Rc::new(Cell::new(None));
+        let measure_bounds = Rc::new(Cell::new(None));
+        let (_view, cx) = cx.add_window_view(|_window, _cx| MeasureProbe {
+            preview_bounds: preview_bounds.clone(),
+            measure_bounds: measure_bounds.clone(),
+        });
+        cx.run_until_parked();
+
+        let viewport = cx.update(|window, _cx| window.viewport_size());
+        let preview_bounds = preview_bounds
+            .get()
+            .expect("preview was laid out and prepainted");
+        let measure_bounds = measure_bounds
+            .get()
+            .expect("measure canvas was laid out and prepainted");
+
+        // The pane must actually be on screen for the comparison to mean anything.
+        assert!(f32::from(preview_bounds.size.height) > 0.0);
+        assert!(preview_bounds.origin.y < viewport.height);
+        // The canvas must overlay the preview exactly — NOT sit at its static position one
+        // pane-height further down (which put image_bounds off-screen and killed every click).
+        assert_eq!(measure_bounds, preview_bounds);
     }
 
     #[test]
